@@ -1,0 +1,35 @@
+# ==============================================================================
+# Quadruped Robot — Parameter Configuration
+# ==============================================================================
+# This file is loaded by robot.launch.py and fed to all nodes that accept it.
+# Node-specific parameters are namespaced under the node name.
+
+# ---- serial_bridge_node ----
+serial_bridge_node:
+  ros__parameters:
+    port: "/dev/ttyACM0"
+    baudrate: 115200
+
+# ---- strategy_manager_node ----
+strategy_manager_node:
+  ros__parameters:
+    control_frequency: 100.0   # Hz — main loop rate
+    gait_type: "trot"          # trot | walk | bound | pace
+    max_linear_velocity: 0.5   # m/s
+    max_angular_velocity: 1.0  # rad/s
+
+# ---- vision_node (placeholder) ----
+vision_node:
+  ros__parameters:
+    model_path: ""
+    confidence_threshold: 0.5
+    camera_topic: "/camera/image_raw"
+
+# ---- LiDAR (placeholder — uncomment when hardware is added) ----
+# lidar_node:
+#   ros__parameters:
+#     serial_port: "/dev/ttyUSB0"
+#     serial_baudrate: 256000
+#     frame_id: "laser_frame"
+#     inverted: false
+#     angle_compensate: true

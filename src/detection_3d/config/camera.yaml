@@ -1,0 +1,18 @@
+# Camera launch parameter overrides for Gemini Pro
+# These are passed as launch arguments to gemini.launch.xml
+
+# Enable hardware depth-to-color alignment
+depth_registration: "true"
+
+# Enable colored point cloud
+enable_colored_point_cloud: "true"
+
+# Color stream: 640x480 @ 30fps
+color_width: "640"
+color_height: "480"
+color_fps: "30"
+
+# Depth stream: 640x400 @ 30fps
+depth_width: "640"
+depth_height: "400"
+depth_fps: "30"
