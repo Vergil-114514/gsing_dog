@@ -1,0 +1,3 @@
+# pip-only packages not resolvable by rosdep
+# Install: pip install -r requirements.txt
+ultralytics

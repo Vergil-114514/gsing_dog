@@ -10,6 +10,8 @@ from vision_msgs.msg import (
 )
 from cv_bridge import CvBridge
 from ultralytics import YOLO
+from ament_index_python.packages import get_package_share_directory
+import os
 
 
 class YoloDetectorNode(Node):
@@ -17,10 +19,16 @@ class YoloDetectorNode(Node):
     def __init__(self):
         super().__init__('yolo_detector')
 
-        self.declare_parameter('model_path', '/home/leon/code/arm_camra/src/detection_3d/models/best.pt')
+        default_model = os.path.join(
+            get_package_share_directory('detection_3d'), 'models', 'best.pt'
+        )
+
+        self.declare_parameter('model_path', default_model)
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('input_topic', '/camera/color/image_raw')
         self.declare_parameter('publish_annotated_image', True)
+        self.declare_parameter('publish_detections_topic', '/detection/detections_2d')
+        self.declare_parameter('publish_annotated_topic', '/detection/annotated_image')
         self.declare_parameter('infer_size', 640)
         self.declare_parameter('skip_frames', 0)
 
@@ -28,6 +36,8 @@ class YoloDetectorNode(Node):
         self.confidence = self.get_parameter('confidence_threshold').value
         input_topic = self.get_parameter('input_topic').value
         self.publish_annotated = self.get_parameter('publish_annotated_image').value
+        detections_topic = self.get_parameter('publish_detections_topic').value
+        annotated_topic = self.get_parameter('publish_annotated_topic').value
         self.infer_size = self.get_parameter('infer_size').value
         self.skip_frames = self.get_parameter('skip_frames').value
 
@@ -44,11 +54,11 @@ class YoloDetectorNode(Node):
             Image, input_topic, self.image_callback, 10
         )
         self.pub_detections = self.create_publisher(
-            Detection2DArray, '/detection/detections_2d', 10
+            Detection2DArray, detections_topic, 10
         )
         if self.publish_annotated:
             self.pub_annotated = self.create_publisher(
-                Image, '/detection/annotated_image', 10
+                Image, annotated_topic, 10
             )
 
         self.get_logger().info(

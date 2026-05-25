@@ -2,34 +2,27 @@
 robot.launch.py — Bringup the full quadruped robot stack.
 
 Launches:
-  1. serial_bridge_node   (MCU ↔ ROS2 bridge)
-  2. strategy_manager_node (high-level coordination)
-  3. (placeholder) LiDAR driver + Nav2
-  4. (placeholder) vision_node
+  1. strategy_manager_node (high-level coordination)
+  2. (placeholder) LiDAR driver + Nav2
+  3. (placeholder) vision_node
+
+Note: serial_bridge_node has been superseded by detection_3d/arm_serial_bridge.
+      All serial I/O now goes through the Python-side unified serial bridge
+      using the 0x55 0xAA protocol. See detection_3d/launch/bringup.launch.py.
 
 Usage:
-  ros2 launch quadruped_bringup robot.launch.py port:=/dev/ttyACM0 baudrate:=115200
+  ros2 launch quadruped_bringup robot.launch.py
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
     # ---- Arguments ----
-    port_arg = DeclareLaunchArgument(
-        'port', default_value='/dev/ttyACM0',
-        description='Serial device path for MCU communication'
-    )
-    baudrate_arg = DeclareLaunchArgument(
-        'baudrate', default_value='115200',
-        description='Serial baudrate'
-    )
     use_lidar_arg = DeclareLaunchArgument(
         'use_lidar', default_value='false',
         description='Set to true to include LiDAR driver launch'
@@ -44,17 +37,6 @@ def generate_launch_description():
     )
 
     # ---- Nodes ----
-    serial_bridge_node = Node(
-        package='quadruped_control',
-        executable='serial_bridge_node',
-        name='serial_bridge_node',
-        output='screen',
-        parameters=[PathJoinSubstitution([
-            FindPackageShare('quadruped_bringup'), 'config', 'params.yaml'
-        ])],
-        arguments=['--ros-args', '--log-level', 'INFO'],
-    )
-
     strategy_manager_node = Node(
         package='quadruped_control',
         executable='strategy_manager_node',
@@ -93,12 +75,9 @@ def generate_launch_description():
     # )
 
     return LaunchDescription([
-        port_arg,
-        baudrate_arg,
         use_lidar_arg,
         use_nav2_arg,
         use_vision_arg,
-        serial_bridge_node,
         strategy_manager_node,
         vision_node,
         # lidar_launch,

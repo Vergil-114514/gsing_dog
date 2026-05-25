@@ -1,64 +1,66 @@
 # ============================================
-# YOLO Detector Parameters (CPU-optimized for N100)
+# YOLO Detector Parameters (CPU-optimized)
 # ============================================
 yolo_detector:
   ros__parameters:
 
-    model_path: "/home/gsing/code/arm_camra/src/detection_3d/models/best.pt"
-    # Minimum confidence threshold
     confidence_threshold: 0.5
-    # Input image topic from camera
     input_topic: "/camera/color/image_raw"
-    # Whether to publish annotated image with bounding boxes
     publish_annotated_image: true
-    # Inference input size (640 = full accuracy)
+    publish_detections_topic: "/detection/detections_2d"
+    publish_annotated_topic: "/detection/annotated_image"
     infer_size: 640
-    # Skip N frames between inferences (0=process all, 2=every 3rd frame)
-    # On N100: set to 2~4 for 640 input to balance latency
     skip_frames: 0
-  
+
 # ============================================
 # 3D Detection Calculator Parameters
 # ============================================
 detection_3d_calculator:
   ros__parameters:
-    # Depth value scale factor (0.001 = millimeters to meters)
     depth_scale: 0.001
-    # Time synchronization tolerance in seconds (larger for CPU latency)
     sync_slop: 1.0
-    # NxN pixel patch size for median depth extraction
     depth_roi_size: 5
-    # TF frame ID for the camera
     camera_frame: "camera_link"
-    # Input topics
     depth_topic: "/camera/depth/image_raw"
     detection_topic: "/detection/detections_2d"
     camera_info_topic: "/camera/depth/camera_info"
+    publish_detections_3d_topic: "/detection/detections_3d"
+    publish_markers_topic: "/detection/markers"
+    # Resolution of the source RGB image used for YOLO inference
+    source_image_width: 640
+    source_image_height: 480
+    max_depth_m: 10.0
 
 # ============================================
 # Arm Serial Bridge Parameters
 # ============================================
 arm_serial_bridge:
   ros__parameters:
-    # USB CDC serial port to STM32
     serial_port: "auto"
     baud_rate: 115200
-    # Send rate to STM32 (Hz)
     send_rate: 10.0
-    # Input topic
     detection_topic: "/detection/detections_3d"
-    # Suction control topic (std_msgs/Bool)
     suction_topic: "/arm/suction"
-    # Filter by class name (empty = pick highest confidence from any class)
     target_class: ""
-    # Send only when the filtered stable point moves by at least this much.
     min_send_delta_m: 0.03
-    # Exponential moving average: lower is smoother, higher follows faster.
     ema_alpha: 0.25
-    # A target must stay inside this radius for stable_frames detections.
     stable_radius_m: 0.02
     stable_frames: 3
-    # Hard cap for STM32 target updates, even if detections arrive faster.
     max_send_rate: 3.0
-    # Drain STM32 feedback frames so the USB CDC IN endpoint does not pile up.
     read_feedback: true
+
+    # TF: camera -> arm_base (base offset; dynamic from arm joints via FK)
+    target_frame: "arm_base"
+    camera_frame: "camera_link"
+    camera_to_arm_xyz: [0.0, 0.0, 0.0]
+    camera_to_arm_rpy: [0.0, 0.0, 0.0]
+
+    # Place target (arm_base coords, fixed index)
+    # Flat array: [x1, y1, z1,  x2, y2, z2, ...]
+    place_targets_m: [0.0, 0.0, 0.0]
+    place_target_index: 0
+
+    # Leg / arm forwarding (from C++ strategy_manager)
+    leg_command_topic: "leg_command"
+    arm_pump_command_topic: "arm_pump_command"
+    robot_state_topic: "robot_state"

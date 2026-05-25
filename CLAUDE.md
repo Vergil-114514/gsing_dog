@@ -81,4 +81,17 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ---
 
+## 7. 代码注释规范
+
+**按规范写注释，不偷懒。**
+
+- 所有公开函数、类、方法必须有注释说明用途、参数、返回值。
+- 注释解释 **WHY**（为什么这样做），不解释 **WHAT**（代码做了什么）——代码本身已经说了 WHAT。
+- 复杂逻辑、非常规写法、hack/workaround 必须注释说明原因。
+- 注释使用项目统一的语言和风格（中文项目用中文，英文项目用英文）。
+- 不写废话注释（如 `// 给 x 加 1` 对应 `x += 1`）。
+- 不要用注释掩盖烂代码——如果代码需要大段注释才能理解，先考虑重构代码本身。
+
+---
+
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

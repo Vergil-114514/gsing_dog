@@ -19,6 +19,11 @@
   <depend>std_msgs</depend>
   <depend>astra_camera</depend>
   <depend>astra_camera_msgs</depend>
+  <depend>quadruped_interfaces</depend>
+  <depend>python3-numpy</depend>
+  <depend>python3-opencv</depend>
+  <!-- ament_index_python is part of ROS2 base, no separate key needed.
+       ultralytics is a pip-only package; see requirements.txt -->
 
   <buildtool_depend>ament_python</buildtool_depend>
 

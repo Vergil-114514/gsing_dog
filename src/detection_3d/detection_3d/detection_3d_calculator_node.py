@@ -14,6 +14,8 @@ from cv_bridge import CvBridge
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from tf2_ros import TransformBroadcaster
 
+from detection_3d.geometry import project_pixel_to_xyz
+
 
 class Detection3DCalculatorNode(Node):
 
@@ -27,6 +29,11 @@ class Detection3DCalculatorNode(Node):
         self.declare_parameter('depth_topic', '/camera/depth/image_raw')
         self.declare_parameter('detection_topic', '/detection/detections_2d')
         self.declare_parameter('camera_info_topic', '/camera/depth/camera_info')
+        self.declare_parameter('publish_detections_3d_topic', '/detection/detections_3d')
+        self.declare_parameter('publish_markers_topic', '/detection/markers')
+        self.declare_parameter('source_image_width', 640)
+        self.declare_parameter('source_image_height', 480)
+        self.declare_parameter('max_depth_m', 10.0)
 
         self.depth_scale = self.get_parameter('depth_scale').value
         sync_slop = self.get_parameter('sync_slop').value
@@ -35,6 +42,11 @@ class Detection3DCalculatorNode(Node):
         depth_topic = self.get_parameter('depth_topic').value
         detection_topic = self.get_parameter('detection_topic').value
         camera_info_topic = self.get_parameter('camera_info_topic').value
+        det3d_topic = self.get_parameter('publish_detections_3d_topic').value
+        markers_topic = self.get_parameter('publish_markers_topic').value
+        self.source_w = self.get_parameter('source_image_width').value
+        self.source_h = self.get_parameter('source_image_height').value
+        self.max_depth_m = self.get_parameter('max_depth_m').value
 
         self.bridge = CvBridge()
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -60,18 +72,16 @@ class Detection3DCalculatorNode(Node):
         self.sync.registerCallback(self.sync_callback)
 
         self.pub_detections_3d = self.create_publisher(
-            Detection3DArray, '/detection/detections_3d', 10
+            Detection3DArray, det3d_topic, 10
         )
         self.pub_markers = self.create_publisher(
-            MarkerArray, '/detection/markers', 10
+            MarkerArray, markers_topic, 10
         )
-
-        # Pre-allocate reusable delete marker for clearing old markers
-        self._prev_marker_count = 0
 
         self.get_logger().info(
             f'Detection3DCalculator ready. depth_scale={self.depth_scale}, '
-            f'roi={self.roi_size}x{self.roi_size}, frame={self.camera_frame}'
+            f'roi={self.roi_size}x{self.roi_size}, frame={self.camera_frame}, '
+            f'source_res={self.source_w}x{self.source_h}'
         )
 
     def camera_info_callback(self, msg: CameraInfo):
@@ -97,9 +107,12 @@ class Detection3DCalculatorNode(Node):
         depth_h, depth_w = depth_image.shape[:2]
         half = self.roi_size // 2
 
+        scale_x = depth_w / self.source_w
+        scale_y = depth_h / self.source_h
+
         det3d_array = Detection3DArray()
         det3d_array.header.stamp = depth_msg.header.stamp
-        det3d_array.header.frame_id = self.camera_frame
+        det3d_array.header.frame_id = depth_msg.header.frame_id or self.camera_frame
 
         marker_array = MarkerArray()
         marker_id = 0
@@ -112,9 +125,6 @@ class Detection3DCalculatorNode(Node):
             cls_name = det2d.results[0].hypothesis.class_id
             score = det2d.results[0].hypothesis.score
 
-            # Scale 2D bbox center from RGB resolution to depth resolution
-            scale_x = depth_w / 640.0   # RGB width is 640
-            scale_y = depth_h / 480.0   # RGB height is 480
             u = int(det2d.bbox.center.position.x * scale_x)
             v = int(det2d.bbox.center.position.y * scale_y)
             u = max(half, min(u, depth_w - 1 - half))
@@ -127,13 +137,11 @@ class Detection3DCalculatorNode(Node):
 
             depth_val = float(np.median(valid))
             z = depth_val * self.depth_scale
-            if z <= 0.0 or z > 10.0:
+            if z <= 0.0 or z > self.max_depth_m:
                 continue
 
-            x = (u - self.cx) * z / self.fx
-            y = (v - self.cy) * z / self.fy
+            x, y, z = project_pixel_to_xyz(u, v, z, self.fx, self.fy, self.cx, self.cy)
 
-            # Detection3D
             det3d = Detection3D()
             det3d.header = det3d_array.header
             det3d.id = det2d.id
@@ -155,7 +163,6 @@ class Detection3DCalculatorNode(Node):
             det3d.results.append(hyp)
             det3d_array.detections.append(det3d)
 
-            # Batch TF
             t = TransformStamped()
             t.header = det3d_array.header
             t.child_frame_id = f'detected_{cls_name}_{det2d.id}'
@@ -165,7 +172,6 @@ class Detection3DCalculatorNode(Node):
             t.transform.rotation.w = 1.0
             tf_list.append(t)
 
-            # Sphere marker
             sphere = Marker()
             sphere.header = det3d_array.header
             sphere.ns = 'detections'
@@ -185,7 +191,6 @@ class Detection3DCalculatorNode(Node):
             marker_array.markers.append(sphere)
             marker_id += 1
 
-            # Text marker
             text = Marker()
             text.header = det3d_array.header
             text.ns = 'labels'
@@ -210,14 +215,11 @@ class Detection3DCalculatorNode(Node):
                 f'{cls_name} at ({x:.3f}, {y:.3f}, {z:.3f})m conf={score:.2f}'
             )
 
-        # Batch publish
         self.pub_detections_3d.publish(det3d_array)
         if tf_list:
             self.tf_broadcaster.sendTransform(tf_list)
         if marker_array.markers:
             self.pub_markers.publish(marker_array)
-
-        self._prev_marker_count = marker_id
 
 
 def main(args=None):
