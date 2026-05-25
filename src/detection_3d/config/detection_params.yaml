@@ -49,13 +49,7 @@ arm_serial_bridge:
     max_send_rate: 3.0
     read_feedback: true
 
-    # TF: camera -> arm_base (base offset; dynamic from arm joints via FK)
-    target_frame: "arm_base"
-    camera_frame: "camera_link"
-    camera_to_arm_xyz: [0.0, 0.0, 0.0]
-    camera_to_arm_rpy: [0.0, 0.0, 0.0]
-
-    # Place target (arm_base coords, fixed index)
+    # Place target (fixed index; frame defined by MCU)
     # Flat array: [x1, y1, z1,  x2, y2, z2, ...]
     place_targets_m: [0.0, 0.0, 0.0]
     place_target_index: 0

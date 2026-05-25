@@ -1,9 +1,8 @@
-"""Full system bringup: camera + detection + optional RViz + optional arm bridge."""
+"""Full system bringup: detection + optional RViz + optional arm bridge."""
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
@@ -56,25 +55,6 @@ def generate_launch_description():
         'source_image_height', default_value='480',
         description='Source RGB image height used for YOLO inference',
     )
-    target_frame_arg = DeclareLaunchArgument(
-        'target_frame', default_value='arm_base',
-        description='Target frame for grasp/place coordinates',
-    )
-    camera_to_arm_xyz_arg = DeclareLaunchArgument(
-        'camera_to_arm_xyz', default_value='[0.0, 0.0, 0.0]',
-        description='Base offset: camera -> arm_base translation [x, y, z] in meters',
-    )
-    camera_to_arm_rpy_arg = DeclareLaunchArgument(
-        'camera_to_arm_rpy', default_value='[0.0, 0.0, 0.0]',
-        description='Base offset: camera -> arm_base rotation [roll, pitch, yaw] in radians',
-    )
-
-    # ---- Camera launch ----
-    camera_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(pkg_dir, 'launch', 'camera.launch.py')
-        ),
-    )
 
     # ---- Detection nodes ----
     yolo_node = Node(
@@ -108,9 +88,6 @@ def generate_launch_description():
         parameters=[params_file, {
             'serial_port': LaunchConfiguration('serial_port'),
             'target_class': LaunchConfiguration('target_class'),
-            'target_frame': LaunchConfiguration('target_frame'),
-            'camera_to_arm_xyz': LaunchConfiguration('camera_to_arm_xyz'),
-            'camera_to_arm_rpy': LaunchConfiguration('camera_to_arm_rpy'),
         }],
         output='screen',
         condition=IfCondition(LaunchConfiguration('use_arm_bridge')),
@@ -138,10 +115,6 @@ def generate_launch_description():
         target_class_arg,
         source_w_arg,
         source_h_arg,
-        target_frame_arg,
-        camera_to_arm_xyz_arg,
-        camera_to_arm_rpy_arg,
-        camera_launch,
         yolo_node,
         calc_node,
         arm_bridge_node,

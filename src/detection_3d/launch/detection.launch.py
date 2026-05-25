@@ -38,18 +38,6 @@ def generate_launch_description():
         'source_image_height', default_value='480',
         description='Source RGB image height used for YOLO inference',
     )
-    target_frame_arg = DeclareLaunchArgument(
-        'target_frame', default_value='arm_base',
-        description='Target frame for grasp/place coordinates',
-    )
-    camera_to_arm_xyz_arg = DeclareLaunchArgument(
-        'camera_to_arm_xyz', default_value='[0.0, 0.0, 0.0]',
-        description='Base offset: camera -> arm_base translation [x, y, z] in meters',
-    )
-    camera_to_arm_rpy_arg = DeclareLaunchArgument(
-        'camera_to_arm_rpy', default_value='[0.0, 0.0, 0.0]',
-        description='Base offset: camera -> arm_base rotation [roll, pitch, yaw] in radians',
-    )
 
     return LaunchDescription([
         model_path_arg,
@@ -59,9 +47,6 @@ def generate_launch_description():
         use_arm_bridge_arg,
         source_w_arg,
         source_h_arg,
-        target_frame_arg,
-        camera_to_arm_xyz_arg,
-        camera_to_arm_rpy_arg,
         Node(
             package='detection_3d',
             executable='yolo_detector',
@@ -88,11 +73,7 @@ def generate_launch_description():
             package='detection_3d',
             executable='arm_serial_bridge',
             name='arm_serial_bridge',
-            parameters=[params_file, {
-                'target_frame': LaunchConfiguration('target_frame'),
-                'camera_to_arm_xyz': LaunchConfiguration('camera_to_arm_xyz'),
-                'camera_to_arm_rpy': LaunchConfiguration('camera_to_arm_rpy'),
-            }],
+            parameters=[params_file],
             output='screen',
             condition=IfCondition(LaunchConfiguration('use_arm_bridge')),
         ),

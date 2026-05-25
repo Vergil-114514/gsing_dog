@@ -71,9 +71,15 @@ def pack_arm_joint_pump_command(
     return build_frame(FUNC_ARM_JOINT_PUMP, payload)
 
 
-def pack_arm_target_xyz(x: float, y: float, z: float) -> bytes:
-    """Pack cartesian arm target (arm_base frame, meters)."""
-    return build_frame(FUNC_ARM_TARGET_XYZ, struct.pack('<fff', x, y, z))
+def pack_arm_target_xyz(flag: int, x: float, y: float, z: float) -> bytes:
+    """Pack cartesian arm target with grasp/place flag.
+
+    flag = 0 → grasp (default)
+    flag = 1 → place
+
+    payload: u8 flag + 3×f32 (x,y,z) arm_base, meters  (13 bytes)
+    """
+    return build_frame(FUNC_ARM_TARGET_XYZ, struct.pack('<Bfff', flag, x, y, z))
 
 
 def pack_suction(enabled: bool) -> bytes:

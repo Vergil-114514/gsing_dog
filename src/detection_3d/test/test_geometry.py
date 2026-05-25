@@ -1,37 +1,5 @@
 import pytest
-from detection_3d.geometry import optical_to_stm32_camera, project_pixel_to_xyz
-
-
-def test_optical_to_stm32_origin():
-    result = optical_to_stm32_camera((0.0, 0.0, 0.0))
-    assert result == (0.0, 0.0, 0.0)
-
-
-def test_optical_to_stm32_forward_point():
-    """Point directly forward in optical frame (+Z)."""
-    # optical: +X right, +Y down, +Z forward
-    # stm32:   +X right, -Y forward, +Z down
-    # optical (0, 0, 1.0) → stm32 (0, -1.0, 0)
-    result = optical_to_stm32_camera((0.0, 0.0, 1.0))
-    assert result == (0.0, -1.0, 0.0)
-
-
-def test_optical_to_stm32_down_point():
-    """Point downwards in optical frame (+Y)."""
-    # optical (0, 1.0, 0) → stm32 (0, 0, 1.0)
-    result = optical_to_stm32_camera((0.0, 1.0, 0.0))
-    assert result == (0.0, 0.0, 1.0)
-
-
-def test_optical_to_stm32_right_point():
-    """Point to the right — should be identical in both frames."""
-    result = optical_to_stm32_camera((1.0, 0.0, 0.0))
-    assert result == (1.0, 0.0, 0.0)
-
-
-def test_optical_to_stm32_mixed():
-    result = optical_to_stm32_camera((1.0, 0.5, 2.0))
-    assert result == (1.0, -2.0, 0.5)
+from detection_3d.geometry import project_pixel_to_xyz
 
 
 def test_project_pixel_to_xyz_center():

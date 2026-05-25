@@ -1,9 +1,4 @@
-"""Coordinate transforms: ROS optical frame ↔ STM32 camera frame, pixel → 3D."""
-
-
-def optical_to_stm32_camera(optical: tuple[float, float, float]) -> tuple[float, float, float]:
-    """ROS optical (+X right, +Y down, +Z forward) → STM32 (+X right, -Y forward, +Z down)."""
-    return (optical[0], -optical[2], optical[1])
+"""Coordinate transforms: pixel → 3D camera-frame projection."""
 
 
 def project_pixel_to_xyz(u: float, v: float, depth: float,

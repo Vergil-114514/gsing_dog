@@ -31,21 +31,30 @@ def test_build_frame_checksum():
 
 
 def test_pack_arm_target_xyz_payload_length():
-    frame = pack_arm_target_xyz(1.0, 2.0, 3.0)
-    # 4 header + 12 payload + 1 checksum = 17 bytes
-    assert len(frame) == 17
+    frame = pack_arm_target_xyz(0, 1.0, 2.0, 3.0)
+    # 4 header + 13 payload + 1 checksum = 18 bytes
+    assert len(frame) == 18
     assert frame[2] == FUNC_ARM_CONTROL
-    assert frame[3] == 12
+    assert frame[3] == 13  # u8 flag + 3×f32
 
 
 def test_pack_arm_target_xyz_roundtrip():
     x, y, z = 0.5, -0.25, 1.75
-    frame = pack_arm_target_xyz(x, y, z)
-    payload = frame[4:16]
-    rx, ry, rz = struct.unpack('<fff', payload)
+    flag = 0
+    frame = pack_arm_target_xyz(flag, x, y, z)
+    payload = frame[4:-1]
+    r_flag, rx, ry, rz = struct.unpack('<Bfff', payload)
+    assert r_flag == flag
     assert rx == pytest.approx(x)
     assert ry == pytest.approx(y)
     assert rz == pytest.approx(z)
+
+
+def test_pack_arm_target_xyz_flag_1():
+    frame = pack_arm_target_xyz(1, 1.0, 2.0, 3.0)
+    payload = frame[4:-1]
+    r_flag = struct.unpack('<B', payload[:1])[0]
+    assert r_flag == 1
 
 
 def test_pack_suction_on():

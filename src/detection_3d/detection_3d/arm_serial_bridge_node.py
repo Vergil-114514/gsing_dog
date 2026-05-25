@@ -1,42 +1,31 @@
 """
 ROS2 node: Unified USB CDC serial bridge to STM32 MCU.
 
-Handles ALL host <-> MCU communication over a single serial port.
-
 Host -> MCU:
   func 0x10 — leg joint control
   func 0x11 — arm joint + pump control
-  func 0x12 — arm cartesian target (arm_base, meters)
+  func 0x12 — arm cartesian target + grasp/place flag
   func 0x13 — suction on/off
 
 MCU -> Host:
   func 0x20 — robot state feedback (reserved)
   func 0x21 — 4-axis arm joint angles + grasp/place flag
 
-Grasp/place is controlled by the MCU via the flag byte in 0x21 frames:
-  flag = 0 → grasp: transform camera detections -> arm_base, send target
+Grasp/place is controlled by the MCU via the flag byte in 0x21:
+  flag = 0 → grasp: send camera-frame coords directly (MCU does FK)
   flag = 1 → place: send pre-configured place coords
-
-The arm joint angles are used to dynamically update the camera -> arm_base
-TF so that the transform accounts for the arm's current pose.
 """
 
 import glob
-import math
 import os
 import select
-import struct
 import termios
 import time
 
 import rclpy
 from rclpy.node import Node
-from rclpy.time import Duration
 from vision_msgs.msg import Detection3DArray
-from std_msgs.msg import Bool, String
-from geometry_msgs.msg import PointStamped, TransformStamped
-import tf2_ros
-import tf2_geometry_msgs  # noqa: F401 — registers PointStamped support
+from std_msgs.msg import Bool
 
 from detection_3d.protocol import (
     pack_arm_target_xyz,
@@ -49,7 +38,6 @@ from detection_3d.protocol import (
 )
 from detection_3d.target_filter import EMAFilter, StabilityFilter
 from detection_3d.place_targets import validate_place_targets, get_place_target
-from detection_3d.arm_kinematics import joints_to_camera_arm_transform
 
 try:
     from quadruped_interfaces.msg import LegCommand, ArmPumpCommand, RobotState
@@ -99,7 +87,6 @@ class CdcSerial:
             self.fd = None
 
     def write(self, data: bytes) -> bool:
-        """Write all bytes, looping for non-blocking fd short writes."""
         if self.fd is None:
             raise OSError('serial port is not open')
         total = len(data)
@@ -156,21 +143,6 @@ class CdcSerial:
 # Node
 # ---------------------------------------------------------------------------
 
-def _rpy_to_quaternion(roll: float, pitch: float, yaw: float):
-    cy = math.cos(yaw * 0.5)
-    sy = math.sin(yaw * 0.5)
-    cp = math.cos(pitch * 0.5)
-    sp = math.sin(pitch * 0.5)
-    cr = math.cos(roll * 0.5)
-    sr = math.sin(roll * 0.5)
-    return (
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
-        cr * cp * cy + sr * sp * sy,
-    )
-
-
 class ArmSerialBridgeNode(Node):
 
     def __init__(self):
@@ -192,12 +164,6 @@ class ArmSerialBridgeNode(Node):
         self.declare_parameter('stable_frames', 3)
         self.declare_parameter('max_send_rate', 3.0)
         self.declare_parameter('read_feedback', True)
-
-        # ---- TF ----
-        self.declare_parameter('target_frame', 'arm_base')
-        self.declare_parameter('camera_frame', 'camera_link')
-        self.declare_parameter('camera_to_arm_xyz', [0.0, 0.0, 0.0])
-        self.declare_parameter('camera_to_arm_rpy', [0.0, 0.0, 0.0])
 
         # ---- place targets ----
         self.declare_parameter('place_targets_m', [0.0, 0.0, 0.0])
@@ -225,15 +191,6 @@ class ArmSerialBridgeNode(Node):
         self.max_send_rate = float(self.get_parameter('max_send_rate').value)
         self.read_feedback = bool(self.get_parameter('read_feedback').value)
 
-        self.target_frame = self.get_parameter('target_frame').value
-        self.camera_frame = self.get_parameter('camera_frame').value
-        self.camera_to_arm_xyz = tuple(
-            float(v) for v in self.get_parameter('camera_to_arm_xyz').value
-        )
-        self.camera_to_arm_rpy = tuple(
-            float(v) for v in self.get_parameter('camera_to_arm_rpy').value
-        )
-
         place_targets_m_raw = self.get_parameter('place_targets_m').value
         place_target_index = int(self.get_parameter('place_target_index').value)
 
@@ -245,11 +202,6 @@ class ArmSerialBridgeNode(Node):
         # === serial ===
         self.serial = CdcSerial(port, baud)
         self._open_serial()
-
-        # === TF ===
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self._tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         # === filters ===
         self.ema = EMAFilter(alpha=ema_alpha)
@@ -266,12 +218,10 @@ class ArmSerialBridgeNode(Node):
         self._arm_joints: list[float] = [0.0, 0.0, 0.0, 0.0]
         self._latest_stable_target: tuple[float, float, float] | None = None
         self._place_sent: bool = False
-        self._prev_flag: int = 0
 
         # === rate limiting / state ===
         self.last_sent_target = None
         self.last_send_time = 0.0
-        self._last_tf_warning_time = 0.0
 
         # === rx buffer ===
         self._rx_buffer = bytearray()
@@ -311,8 +261,6 @@ class ArmSerialBridgeNode(Node):
             f'min_delta={self.min_send_delta_m:.3f}m, '
             f'ema_alpha={ema_alpha:.2f}, stable={stable_frames} frames, '
             f'target_class="{self.target_class or "any"}", '
-            f'target_frame={self.target_frame}, '
-            f'camera_frame={self.camera_frame}, '
             f'place=({self._place_target[0]:.3f}, '
             f'{self._place_target[1]:.3f}, '
             f'{self._place_target[2]:.3f})m, '
@@ -352,7 +300,6 @@ class ArmSerialBridgeNode(Node):
     # ------------------------------------------------------------------
 
     def _read_and_parse_feedback(self):
-        """Read incoming serial data, parse complete frames."""
         if not self.read_feedback or not self.serial.is_open:
             return
 
@@ -376,7 +323,6 @@ class ArmSerialBridgeNode(Node):
                 )
 
     def _try_parse_frame(self) -> tuple[int, bytes] | None:
-        """Extract one complete frame from rx_buffer. Returns (func_id, payload) or None."""
         while len(self._rx_buffer) >= 5:
             if self._rx_buffer[0] == 0x55 and self._rx_buffer[1] == 0xAA:
                 func_id = self._rx_buffer[2]
@@ -405,7 +351,6 @@ class ArmSerialBridgeNode(Node):
     # ------------------------------------------------------------------
 
     def _handle_arm_pose(self, payload: bytes):
-        """Parse 0x21 arm-pose frame, update dynamic TF."""
         joints, flag = parse_arm_pose(payload)
         self._arm_joints = joints
 
@@ -418,57 +363,23 @@ class ArmSerialBridgeNode(Node):
                 f'({"grasp" if flag == 0 else "place"})'
             )
             if flag == 0:
-                # Switching to grasp: reset filters
                 self.ema.reset()
                 self.stability.reset()
                 self._latest_stable_target = None
             else:
-                # Switching to place: ready to send
                 self._place_sent = False
 
-        # Compute FK and publish dynamic TF
-        self._publish_dynamic_camera_to_arm(joints)
-
     def _handle_robot_state(self, payload: bytes):
-        """Log incoming RobotState frame (payload format TBD with MCU firmware)."""
         self.get_logger().debug(
             f'RobotState rx ({len(payload)}B) — parser not yet defined, '
             f'raw={payload.hex(" ")}'
         )
 
     # ------------------------------------------------------------------
-    # Dynamic TF
-    # ------------------------------------------------------------------
-
-    def _publish_dynamic_camera_to_arm(self, joints: list[float]):
-        """Publish camera_frame -> target_frame TF computed from arm joint angles."""
-        tx, ty, tz, roll, pitch, yaw = joints_to_camera_arm_transform(
-            joints[0], joints[1], joints[2], joints[3],
-            self.camera_to_arm_xyz,
-            self.camera_to_arm_rpy,
-        )
-
-        t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = self.camera_frame
-        t.child_frame_id = self.target_frame
-        t.transform.translation.x = tx
-        t.transform.translation.y = ty
-        t.transform.translation.z = tz
-        qx, qy, qz, qw = _rpy_to_quaternion(roll, pitch, yaw)
-        t.transform.rotation.x = qx
-        t.transform.rotation.y = qy
-        t.transform.rotation.z = qz
-        t.transform.rotation.w = qw
-        self._tf_broadcaster.sendTransform(t)
-
-    # ------------------------------------------------------------------
-    # Detection filtering
+    # Detection filtering (camera-frame coords, no FK)
     # ------------------------------------------------------------------
 
     def detection_callback(self, msg: Detection3DArray):
-        # Always filter detections when in grasp mode (flag=0).
-        # In place mode we skip filtering to save CPU.
         if self._grasp_place_flag != 0:
             return
         if not msg.detections:
@@ -491,48 +402,12 @@ class ArmSerialBridgeNode(Node):
             return
 
         pos = best.results[0].pose.pose.position
-        arm_base = self._transform_to_target(
-            pos.x, pos.y, pos.z, msg.header.frame_id
-        )
-        if arm_base is None:
-            return
+        raw_camera = (float(pos.x), float(pos.y), float(pos.z))
 
-        filtered = self.ema.update(arm_base)
+        filtered = self.ema.update(raw_camera)
         stable = self.stability.update(filtered)
         if stable is not None:
             self._latest_stable_target = stable
-
-    def _transform_to_target(
-        self, x: float, y: float, z: float, source_frame: str
-    ) -> tuple[float, float, float] | None:
-        """Transform a point from source_frame to target_frame. Returns (x,y,z) or None."""
-        if not source_frame:
-            return None
-        try:
-            ps = PointStamped()
-            ps.header.frame_id = source_frame
-            ps.header.stamp = self.get_clock().now().to_msg()
-            ps.point.x = float(x)
-            ps.point.y = float(y)
-            ps.point.z = float(z)
-            tf_timeout = Duration(seconds=0.1)
-            transformed = self.tf_buffer.transform(
-                ps, self.target_frame, timeout=tf_timeout
-            )
-            return (
-                transformed.point.x,
-                transformed.point.y,
-                transformed.point.z,
-            )
-        except Exception as exc:
-            now = time.monotonic()
-            if now - self._last_tf_warning_time > 1.0:
-                self.get_logger().warn(
-                    f'TF transform [{source_frame} -> {self.target_frame}] '
-                    f'failed: {exc}'
-                )
-                self._last_tf_warning_time = now
-            return None
 
     # ------------------------------------------------------------------
     # Callbacks — suction / leg / arm forwarding
@@ -568,7 +443,7 @@ class ArmSerialBridgeNode(Node):
             )
 
     # ------------------------------------------------------------------
-    # Timer — send grasp / place based on MCU flag
+    # Timer — send based on MCU flag
     # ------------------------------------------------------------------
 
     def send_timer_callback(self):
@@ -588,7 +463,6 @@ class ArmSerialBridgeNode(Node):
 
         ok = self._send_target_immediate(target, 'grasp')
         if not ok:
-            # Send failed — keep target for retry
             self._latest_stable_target = target
 
     def _maybe_send_place(self):
@@ -598,7 +472,6 @@ class ArmSerialBridgeNode(Node):
         ok = self._send_target_immediate(self._place_target, 'place')
         if ok:
             self._place_sent = True
-        # On failure, retry on next tick
 
     # ------------------------------------------------------------------
     # Send helpers
@@ -615,15 +488,16 @@ class ArmSerialBridgeNode(Node):
             )
             return False
 
-        frame = pack_arm_target_xyz(target[0], target[1], target[2])
+        flag = 0 if tag == 'grasp' else 1
+        frame = pack_arm_target_xyz(flag, target[0], target[1], target[2])
         if not self._write_frame(frame):
             return False
 
         self.last_sent_target = target
         self.last_send_time = now
         self.get_logger().info(
-            f'Sent {tag} arm_base=({target[0]:.3f}, '
-            f'{target[1]:.3f}, {target[2]:.3f})m'
+            f'Sent {tag} flag={flag} '
+            f'({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})m'
         )
         return True
 

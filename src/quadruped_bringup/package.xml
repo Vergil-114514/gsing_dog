@@ -10,7 +10,6 @@
   <depend>rclpy</depend>
 
   <exec_depend>quadruped_control</exec_depend>
-  <exec_depend>quadruped_vision</exec_depend>
   <exec_depend>ros2launch</exec_depend>
 
   <export>
