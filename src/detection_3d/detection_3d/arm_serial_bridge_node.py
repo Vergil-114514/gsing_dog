@@ -1,19 +1,8 @@
 """
-ROS2 node: Unified USB CDC serial bridge to STM32 MCU.
+ROS2 node: USB CDC serial bridge to STM32 MCU.
 
-Host -> MCU:
-  func 0x10 — leg joint control
-  func 0x11 — arm joint + pump control
-  func 0x12 — arm cartesian target + grasp/place flag
-  func 0x13 — suction on/off
-
-MCU -> Host:
-  func 0x20 — robot state feedback (reserved)
-  func 0x21 — 4-axis arm joint angles + grasp/place flag
-
-Grasp/place is controlled by the MCU via the flag byte in 0x21:
-  flag = 0 → grasp: send camera-frame coords directly (MCU does FK)
-  flag = 1 → place: send pre-configured place coords
+Host -> MCU:  func 0x12 — camera-frame arm target XYZ
+MCU -> Host:  func 0x21 — 1-byte grasp/place flag (0=grasp, 1=place)
 """
 
 import glob
@@ -25,28 +14,14 @@ import time
 import rclpy
 from rclpy.node import Node
 from vision_msgs.msg import Detection3DArray
-from std_msgs.msg import Bool
 
 from detection_3d.protocol import (
     pack_arm_target_xyz,
-    pack_arm_joint_pump_command,
-    pack_leg_command,
-    pack_suction,
-    parse_arm_pose,
-    FUNC_ARM_POSE,
-    FUNC_ROBOT_STATE,
+    parse_arm_flag,
+    FUNC_ARM_FLAG,
 )
 from detection_3d.target_filter import EMAFilter, StabilityFilter
 from detection_3d.place_targets import validate_place_targets, get_place_target
-
-try:
-    from quadruped_interfaces.msg import LegCommand, ArmPumpCommand, RobotState
-    _HAS_QUADRUPED_INTERFACES = True
-except ImportError:
-    LegCommand = None       # type: ignore
-    ArmPumpCommand = None   # type: ignore
-    RobotState = None       # type: ignore
-    _HAS_QUADRUPED_INTERFACES = False
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +133,6 @@ class ArmSerialBridgeNode(Node):
         self.declare_parameter('target_class', '')
 
         # ---- filtering ----
-        self.declare_parameter('min_send_delta_m', 0.03)
         self.declare_parameter('ema_alpha', 0.25)
         self.declare_parameter('stable_radius_m', 0.02)
         self.declare_parameter('stable_frames', 3)
@@ -169,14 +143,6 @@ class ArmSerialBridgeNode(Node):
         self.declare_parameter('place_targets_m', [0.0, 0.0, 0.0])
         self.declare_parameter('place_target_index', 0)
 
-        # ---- topics (vision) ----
-        self.declare_parameter('suction_topic', '/arm/suction')
-
-        # ---- topics (quadruped leg / arm) ----
-        self.declare_parameter('leg_command_topic', 'leg_command')
-        self.declare_parameter('arm_pump_command_topic', 'arm_pump_command')
-        self.declare_parameter('robot_state_topic', 'robot_state')
-
         # === resolve parameters ===
 
         port = self.get_parameter('serial_port').value
@@ -184,7 +150,6 @@ class ArmSerialBridgeNode(Node):
         self.send_rate = float(self.get_parameter('send_rate').value)
         det_topic = self.get_parameter('detection_topic').value
         self.target_class = self.get_parameter('target_class').value
-        self.min_send_delta_m = float(self.get_parameter('min_send_delta_m').value)
         ema_alpha = float(self.get_parameter('ema_alpha').value)
         stable_radius = float(self.get_parameter('stable_radius_m').value)
         stable_frames = int(self.get_parameter('stable_frames').value)
@@ -193,11 +158,6 @@ class ArmSerialBridgeNode(Node):
 
         place_targets_m_raw = self.get_parameter('place_targets_m').value
         place_target_index = int(self.get_parameter('place_target_index').value)
-
-        suction_topic = self.get_parameter('suction_topic').value
-        leg_topic = self.get_parameter('leg_command_topic').value
-        arm_pump_topic = self.get_parameter('arm_pump_command_topic').value
-        robot_state_topic = self.get_parameter('robot_state_topic').value
 
         # === serial ===
         self.serial = CdcSerial(port, baud)
@@ -215,7 +175,6 @@ class ArmSerialBridgeNode(Node):
 
         # === MCU-driven state ===
         self._grasp_place_flag: int = 0       # 0 = grasp, 1 = place
-        self._arm_joints: list[float] = [0.0, 0.0, 0.0, 0.0]
         self._latest_stable_target: tuple[float, float, float] | None = None
         self._place_sent: bool = False
 
@@ -226,46 +185,24 @@ class ArmSerialBridgeNode(Node):
         # === rx buffer ===
         self._rx_buffer = bytearray()
 
-        # === publishers ===
-        if _HAS_QUADRUPED_INTERFACES:
-            self.robot_state_pub = self.create_publisher(
-                RobotState, robot_state_topic, 10
-            )
-        else:
-            self.robot_state_pub = None
-
         # === subscribers ===
         self.sub_det = self.create_subscription(
             Detection3DArray, det_topic, self.detection_callback, 10
         )
-        self.sub_suction = self.create_subscription(
-            Bool, suction_topic, self.suction_callback, 10
-        )
-
-        if _HAS_QUADRUPED_INTERFACES:
-            self.sub_leg = self.create_subscription(
-                LegCommand, leg_topic, self.leg_callback, 10
-            )
-            self.sub_arm_pump = self.create_subscription(
-                ArmPumpCommand, arm_pump_topic, self.arm_pump_callback, 10
-            )
 
         # === timer ===
         period = 1.0 / max(self.send_rate, 0.1)
         self.timer = self.create_timer(period, self.send_timer_callback)
 
         self.get_logger().info(
-            f'Unified serial bridge ready. '
+            f'Serial bridge ready. '
             f'rate={self.send_rate}Hz, '
             f'max_send_rate={self.max_send_rate}Hz, '
-            f'min_delta={self.min_send_delta_m:.3f}m, '
             f'ema_alpha={ema_alpha:.2f}, stable={stable_frames} frames, '
             f'target_class="{self.target_class or "any"}", '
             f'place=({self._place_target[0]:.3f}, '
             f'{self._place_target[1]:.3f}, '
-            f'{self._place_target[2]:.3f})m, '
-            f'quadruped_ifaces={_HAS_QUADRUPED_INTERFACES}, '
-            f'units=m'
+            f'{self._place_target[2]:.3f})m'
         )
 
     # ------------------------------------------------------------------
@@ -312,10 +249,8 @@ class ArmSerialBridgeNode(Node):
             if frame is None:
                 break
             func_id, payload = frame
-            if func_id == FUNC_ARM_POSE:
-                self._handle_arm_pose(payload)
-            elif func_id == FUNC_ROBOT_STATE:
-                self._handle_robot_state(payload)
+            if func_id == FUNC_ARM_FLAG:
+                self._handle_arm_flag(payload)
             else:
                 self.get_logger().debug(
                     f'MCU frame func=0x{func_id:02X} '
@@ -350,30 +285,32 @@ class ArmSerialBridgeNode(Node):
     # MCU -> Host frame handlers
     # ------------------------------------------------------------------
 
-    def _handle_arm_pose(self, payload: bytes):
-        joints, flag = parse_arm_pose(payload)
-        self._arm_joints = joints
+    def _handle_arm_flag(self, payload: bytes):
+        try:
+            flag = parse_arm_flag(payload)
+        except ValueError as exc:
+            self.get_logger().warn(f'Bad 0x21 frame, dropping: {exc}')
+            return
+
+        if flag not in (0, 1):
+            self.get_logger().warn(f'Unknown flag value {flag}, ignored')
+            return
 
         prev_flag = self._grasp_place_flag
+        if flag == prev_flag:
+            return
+
         self._grasp_place_flag = flag
-
-        if flag != prev_flag:
-            self.get_logger().info(
-                f'MCU flag: {prev_flag} -> {flag} '
-                f'({"grasp" if flag == 0 else "place"})'
-            )
-            if flag == 0:
-                self.ema.reset()
-                self.stability.reset()
-                self._latest_stable_target = None
-            else:
-                self._place_sent = False
-
-    def _handle_robot_state(self, payload: bytes):
-        self.get_logger().debug(
-            f'RobotState rx ({len(payload)}B) — parser not yet defined, '
-            f'raw={payload.hex(" ")}'
+        self.get_logger().info(
+            f'MCU flag: {prev_flag} -> {flag} '
+            f'({"grasp" if flag == 0 else "place"})'
         )
+        if flag == 0:
+            self.ema.reset()
+            self.stability.reset()
+            self._latest_stable_target = None
+        else:
+            self._place_sent = False
 
     # ------------------------------------------------------------------
     # Detection filtering (camera-frame coords, no FK)
@@ -408,39 +345,6 @@ class ArmSerialBridgeNode(Node):
         stable = self.stability.update(filtered)
         if stable is not None:
             self._latest_stable_target = stable
-
-    # ------------------------------------------------------------------
-    # Callbacks — suction / leg / arm forwarding
-    # ------------------------------------------------------------------
-
-    def suction_callback(self, msg: Bool):
-        frame = pack_suction(msg.data)
-        if self._write_frame(frame):
-            self.get_logger().info(f'Suction {"ON" if msg.data else "OFF"}')
-
-    def leg_callback(self, msg):
-        frame = pack_leg_command(
-            list(msg.joint_positions),
-            list(msg.joint_velocities),
-            int(msg.control_mode),
-        )
-        if self._write_frame(frame):
-            self.get_logger().debug(
-                f'Leg cmd: mode={msg.control_mode}, '
-                f'pos[0]={msg.joint_positions[0]:.3f}'
-            )
-
-    def arm_pump_callback(self, msg):
-        frame = pack_arm_joint_pump_command(
-            list(msg.joint_positions),
-            bool(msg.pump_on),
-            float(msg.pump_pressure),
-        )
-        if self._write_frame(frame):
-            self.get_logger().debug(
-                f'Arm joint cmd: pump={msg.pump_on}, '
-                f'pos[0]={msg.joint_positions[0]:.3f}'
-            )
 
     # ------------------------------------------------------------------
     # Timer — send based on MCU flag
@@ -488,16 +392,14 @@ class ArmSerialBridgeNode(Node):
             )
             return False
 
-        flag = 0 if tag == 'grasp' else 1
-        frame = pack_arm_target_xyz(flag, target[0], target[1], target[2])
+        frame = pack_arm_target_xyz(target[0], target[1], target[2])
         if not self._write_frame(frame):
             return False
 
         self.last_sent_target = target
         self.last_send_time = now
         self.get_logger().info(
-            f'Sent {tag} flag={flag} '
-            f'({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})m'
+            f'Sent {tag} ({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})m'
         )
         return True
 

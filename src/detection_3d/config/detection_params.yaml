@@ -40,21 +40,14 @@ arm_serial_bridge:
     baud_rate: 115200
     send_rate: 10.0
     detection_topic: "/detection/detections_3d"
-    suction_topic: "/arm/suction"
     target_class: ""
-    min_send_delta_m: 0.03
     ema_alpha: 0.25
     stable_radius_m: 0.02
     stable_frames: 3
     max_send_rate: 3.0
     read_feedback: true
 
-    # Place target (fixed index; frame defined by MCU)
+    # Place target in camera frame (fixed index)
     # Flat array: [x1, y1, z1,  x2, y2, z2, ...]
     place_targets_m: [0.0, 0.0, 0.0]
     place_target_index: 0
-
-    # Leg / arm forwarding (from C++ strategy_manager)
-    leg_command_topic: "leg_command"
-    arm_pump_command_topic: "arm_pump_command"
-    robot_state_topic: "robot_state"
