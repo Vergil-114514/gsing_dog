@@ -176,7 +176,6 @@ class ArmSerialBridgeNode(Node):
         # === MCU-driven state ===
         self._grasp_place_flag: int = 0       # 0 = grasp, 1 = place
         self._latest_stable_target: tuple[float, float, float] | None = None
-        self._place_sent: bool = False
 
         # === rate limiting / state ===
         self.last_sent_target = None
@@ -309,8 +308,6 @@ class ArmSerialBridgeNode(Node):
             self.ema.reset()
             self.stability.reset()
             self._latest_stable_target = None
-        else:
-            self._place_sent = False
 
     # ------------------------------------------------------------------
     # Detection filtering (camera-frame coords, no FK)
@@ -359,23 +356,11 @@ class ArmSerialBridgeNode(Node):
             self._maybe_send_place()
 
     def _maybe_send_grasp(self):
-        if self._latest_stable_target is None:
-            return
-
-        target = self._latest_stable_target
-        self._latest_stable_target = None
-
-        ok = self._send_target_immediate(target, 'grasp')
-        if not ok:
-            self._latest_stable_target = target
+        if self._latest_stable_target is not None:
+            self._send_target_immediate(self._latest_stable_target, 'grasp')
 
     def _maybe_send_place(self):
-        if self._place_sent:
-            return
-
-        ok = self._send_target_immediate(self._place_target, 'place')
-        if ok:
-            self._place_sent = True
+        self._send_target_immediate(self._place_target, 'place')
 
     # ------------------------------------------------------------------
     # Send helpers
