@@ -372,7 +372,7 @@ class ArmSerialBridgeNode(Node):
         now = time.monotonic()
         min_interval = 1.0 / max(self.max_send_rate, 0.1)
         if now - self.last_send_time < min_interval:
-            self.get_logger().warn(
+            self.get_logger().debug(
                 f'{tag} target skipped: rate limit ({self.max_send_rate} Hz)'
             )
             return False

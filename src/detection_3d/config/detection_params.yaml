@@ -47,7 +47,7 @@ arm_serial_bridge:
     max_send_rate: 3.0
     read_feedback: true
 
-    # Place target in camera frame (fixed index)
+    # Place target in arm_base frame, meters (÷1000 from MCU mm coords)
     # Flat array: [x1, y1, z1,  x2, y2, z2, ...]
-    place_targets_m: [0.0, 0.0, 0.0]
+    place_targets_m: [-0.100, 0.111, 0.420]
     place_target_index: 0
