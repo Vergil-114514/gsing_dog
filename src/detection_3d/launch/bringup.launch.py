@@ -16,8 +16,8 @@ def generate_launch_description():
     # ---- Launch arguments ----
     model_path_arg = DeclareLaunchArgument(
         'model_path',
-        default_value=os.path.join(pkg_dir, 'models', 'best.pt'),
-        description='Path to YOLO model (.pt or .onnx)',
+        default_value=os.path.join(pkg_dir, 'models', 'best_int8.xml'),
+        description='Path to OpenVINO INT8 model (.xml)',
     )
     serial_port_arg = DeclareLaunchArgument(
         'serial_port', default_value='auto',

@@ -4,13 +4,14 @@
 yolo_detector:
   ros__parameters:
 
-    confidence_threshold: 0.5
+    confidence_threshold: 0.8
+    iou_threshold: 0.20
     input_topic: "/camera/color/image_raw"
     publish_annotated_image: true
     publish_detections_topic: "/detection/detections_2d"
     publish_annotated_topic: "/detection/annotated_image"
     infer_size: 640
-    skip_frames: 0
+    skip_frames: 1
 
 # ============================================
 # 3D Detection Calculator Parameters
@@ -31,6 +32,16 @@ detection_3d_calculator:
     source_image_height: 480
     max_depth_m: 10.0
 
+    # ---- depth quality ----
+    min_depth_valid_ratio: 0.3
+    depth_roi_ratio: 0.3
+    depth_outlier_sigma: 2.0
+
+    # ---- coordinate stability ----
+    max_depth_variance_m2: 0.01
+    coordinate_jump_threshold_m: 0.05
+    stable_window_size: 5
+
 # ============================================
 # Arm Serial Bridge Parameters
 # ============================================
@@ -44,7 +55,7 @@ arm_serial_bridge:
     ema_alpha: 0.25
     stable_radius_m: 0.02
     stable_frames: 3
-    max_send_rate: 3.0
+    max_send_rate: 5.0
     read_feedback: true
 
     # Place target in arm_base frame, meters (÷1000 from MCU mm coords)

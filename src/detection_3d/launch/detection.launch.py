@@ -15,7 +15,7 @@ def generate_launch_description():
 
     model_path_arg = DeclareLaunchArgument(
         'model_path',
-        default_value=os.path.join(pkg_dir, 'models', 'best.pt'),
+        default_value=os.path.join(pkg_dir, 'models', 'best_int8.xml'),
     )
     input_topic_arg = DeclareLaunchArgument(
         'input_topic', default_value='/camera/color/image_raw',

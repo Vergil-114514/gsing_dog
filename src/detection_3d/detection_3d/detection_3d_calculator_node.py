@@ -1,4 +1,14 @@
-import numpy as np
+"""
+ROS2 node: 2D detection → 3D coordinate calculator.
+
+Improvements over v1:
+  - Adaptive ROI (scaled to detection box size) instead of fixed 5x5.
+  - Outlier-filtered depth with quality scoring.
+  - Target selection: pick best candidate by confidence × depth quality.
+  - Coordinate jump detection.
+  - Sliding-window coordinate stabilizer (only publish stable results).
+"""
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
@@ -15,16 +25,30 @@ from message_filters import Subscriber, ApproximateTimeSynchronizer
 from tf2_ros import TransformBroadcaster
 
 from detection_3d.geometry import project_pixel_to_xyz
+from detection_3d.depth_processor import (
+    compute_roi_size,
+    extract_roi,
+    filter_depth_roi,
+)
+from detection_3d.target_selector import (
+    TargetCandidate,
+    compute_composite_score,
+    select_best_target,
+    detect_coordinate_jump,
+)
+from detection_3d.coordinate_stabilizer import CoordinateStabilizer
 
 
 class Detection3DCalculatorNode(Node):
+    """2D detections → 3D coordinates with depth quality filtering and stabilization."""
 
     def __init__(self):
         super().__init__('detection_3d_calculator')
 
+        # ---- depth ----
         self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('sync_slop', 0.15)
-        self.declare_parameter('depth_roi_size', 5)
+        self.declare_parameter('depth_roi_size', 5)          # fallback min ROI
         self.declare_parameter('camera_frame', 'camera_link')
         self.declare_parameter('depth_topic', '/camera/depth/image_raw')
         self.declare_parameter('detection_topic', '/detection/detections_2d')
@@ -35,29 +59,58 @@ class Detection3DCalculatorNode(Node):
         self.declare_parameter('source_image_height', 480)
         self.declare_parameter('max_depth_m', 10.0)
 
-        self.depth_scale = self.get_parameter('depth_scale').value
-        sync_slop = self.get_parameter('sync_slop').value
-        self.roi_size = self.get_parameter('depth_roi_size').value
+        # ---- new: depth quality ----
+        self.declare_parameter('min_depth_valid_ratio', 0.3)
+        self.declare_parameter('depth_roi_ratio', 0.3)
+        self.declare_parameter('depth_outlier_sigma', 2.0)
+
+        # ---- new: stability ----
+        self.declare_parameter('max_depth_variance_m2', 0.01)
+        self.declare_parameter('coordinate_jump_threshold_m', 0.05)
+        self.declare_parameter('stable_window_size', 5)
+
+        # === resolve ===
+
+        self.depth_scale = float(self.get_parameter('depth_scale').value)
+        sync_slop = float(self.get_parameter('sync_slop').value)
+        self.min_roi = int(self.get_parameter('depth_roi_size').value)
         self.camera_frame = self.get_parameter('camera_frame').value
         depth_topic = self.get_parameter('depth_topic').value
         detection_topic = self.get_parameter('detection_topic').value
         camera_info_topic = self.get_parameter('camera_info_topic').value
         det3d_topic = self.get_parameter('publish_detections_3d_topic').value
         markers_topic = self.get_parameter('publish_markers_topic').value
-        self.source_w = self.get_parameter('source_image_width').value
-        self.source_h = self.get_parameter('source_image_height').value
-        self.max_depth_m = self.get_parameter('max_depth_m').value
+        self.source_w = int(self.get_parameter('source_image_width').value)
+        self.source_h = int(self.get_parameter('source_image_height').value)
+        self.max_depth_m = float(self.get_parameter('max_depth_m').value)
 
+        self.min_depth_valid_ratio = float(self.get_parameter('min_depth_valid_ratio').value)
+        self.depth_roi_ratio = float(self.get_parameter('depth_roi_ratio').value)
+        self.outlier_sigma = float(self.get_parameter('depth_outlier_sigma').value)
+
+        self.max_depth_variance_m2 = float(self.get_parameter('max_depth_variance_m2').value)
+        self.jump_threshold_m = float(self.get_parameter('coordinate_jump_threshold_m').value)
+        stable_window_size = int(self.get_parameter('stable_window_size').value)
+
+        # === camera intrinsics (populated from CameraInfo) ===
+        self.fx: float | None = None
+        self.fy: float | None = None
+        self.cx: float | None = None
+        self.cy: float | None = None
+        self.depth_w: int | None = None
+        self.depth_h: int | None = None
+
+        # === state ===
         self.bridge = CvBridge()
         self.tf_broadcaster = TransformBroadcaster(self)
+        self._stabilizer = CoordinateStabilizer(
+            window_size=stable_window_size,
+            max_variance_m2=self.max_depth_variance_m2,
+        )
+        self._prev_best_pos: tuple[float, float, float] | None = None
+        self._prev_best_class: str = ""
 
-        self.fx = None
-        self.fy = None
-        self.cx = None
-        self.cy = None
-        self.depth_w = None
-        self.depth_h = None
-
+        # === subscribers ===
         self.sub_camera_info = self.create_subscription(
             CameraInfo, camera_info_topic, self.camera_info_callback, 10
         )
@@ -71,6 +124,7 @@ class Detection3DCalculatorNode(Node):
         )
         self.sync.registerCallback(self.sync_callback)
 
+        # === publishers ===
         self.pub_detections_3d = self.create_publisher(
             Detection3DArray, det3d_topic, 10
         )
@@ -80,9 +134,16 @@ class Detection3DCalculatorNode(Node):
 
         self.get_logger().info(
             f'Detection3DCalculator ready. depth_scale={self.depth_scale}, '
-            f'roi={self.roi_size}x{self.roi_size}, frame={self.camera_frame}, '
+            f'roi_ratio={self.depth_roi_ratio}, min_roi={self.min_roi}, '
+            f'outlier_sigma={self.outlier_sigma}, '
+            f'valid_ratio>={self.min_depth_valid_ratio}, '
+            f'stable_window={stable_window_size}, jump_thresh={self.jump_threshold_m}m, '
             f'source_res={self.source_w}x{self.source_h}'
         )
+
+    # ------------------------------------------------------------------
+    # Camera intrinsics
+    # ------------------------------------------------------------------
 
     def camera_info_callback(self, msg: CameraInfo):
         if self.fx is not None:
@@ -99,127 +160,189 @@ class Detection3DCalculatorNode(Node):
             f'depth_res={self.depth_w}x{self.depth_h}'
         )
 
+    # ------------------------------------------------------------------
+    # Sync callback — main pipeline
+    # ------------------------------------------------------------------
+
     def sync_callback(self, depth_msg: Image, det2d_msg: Detection2DArray):
         if self.fx is None:
             return
 
         depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
         depth_h, depth_w = depth_image.shape[:2]
-        half = self.roi_size // 2
 
         scale_x = depth_w / self.source_w
         scale_y = depth_h / self.source_h
 
-        det3d_array = Detection3DArray()
-        det3d_array.header.stamp = depth_msg.header.stamp
-        det3d_array.header.frame_id = depth_msg.header.frame_id or self.camera_frame
-
-        marker_array = MarkerArray()
-        marker_id = 0
-        tf_list = []
+        # ---- Phase 1: Build scored candidates ----
+        candidates: list[TargetCandidate] = []
 
         for det2d in det2d_msg.detections:
             if not det2d.results:
                 continue
 
             cls_name = det2d.results[0].hypothesis.class_id
-            score = det2d.results[0].hypothesis.score
+            score = float(det2d.results[0].hypothesis.score)
 
+            # Adaptive ROI based on detection box size
+            box_w = det2d.bbox.size_x
+            box_h = det2d.bbox.size_y
+            roi_size = compute_roi_size(box_w, box_h, self.depth_roi_ratio, self.min_roi)
+
+            # Center in depth image coordinates
             u = int(det2d.bbox.center.position.x * scale_x)
             v = int(det2d.bbox.center.position.y * scale_y)
+            half = roi_size // 2
             u = max(half, min(u, depth_w - 1 - half))
             v = max(half, min(v, depth_h - 1 - half))
 
-            roi = depth_image[v - half:v + half + 1, u - half:u + half + 1]
-            valid = roi[roi > 0]
-            if len(valid) == 0:
+            # Extract and filter depth ROI
+            roi = extract_roi(depth_image, u, v, roi_size)
+            if roi is None:
                 continue
 
-            depth_val = float(np.median(valid))
-            z = depth_val * self.depth_scale
-            if z <= 0.0 or z > self.max_depth_m:
-                continue
-
-            x, y, z = project_pixel_to_xyz(u, v, z, self.fx, self.fy, self.cx, self.cy)
-
-            det3d = Detection3D()
-            det3d.header = det3d_array.header
-            det3d.id = det2d.id
-            det3d.bbox.center.position.x = x
-            det3d.bbox.center.position.y = y
-            det3d.bbox.center.position.z = z
-            det3d.bbox.center.orientation.w = 1.0
-            det3d.bbox.size.x = 0.1
-            det3d.bbox.size.y = 0.1
-            det3d.bbox.size.z = 0.1
-
-            hyp = ObjectHypothesisWithPose()
-            hyp.hypothesis.class_id = cls_name
-            hyp.hypothesis.score = score
-            hyp.pose.pose.position.x = x
-            hyp.pose.pose.position.y = y
-            hyp.pose.pose.position.z = z
-            hyp.pose.pose.orientation.w = 1.0
-            det3d.results.append(hyp)
-            det3d_array.detections.append(det3d)
-
-            t = TransformStamped()
-            t.header = det3d_array.header
-            t.child_frame_id = f'detected_{cls_name}_{det2d.id}'
-            t.transform.translation.x = x
-            t.transform.translation.y = y
-            t.transform.translation.z = z
-            t.transform.rotation.w = 1.0
-            tf_list.append(t)
-
-            sphere = Marker()
-            sphere.header = det3d_array.header
-            sphere.ns = 'detections'
-            sphere.id = marker_id
-            sphere.type = Marker.SPHERE
-            sphere.action = Marker.ADD
-            sphere.pose.position.x = x
-            sphere.pose.position.y = y
-            sphere.pose.position.z = z
-            sphere.pose.orientation.w = 1.0
-            sphere.scale.x = 0.05
-            sphere.scale.y = 0.05
-            sphere.scale.z = 0.05
-            sphere.color.g = 1.0
-            sphere.color.a = 0.8
-            sphere.lifetime.nanosec = 500_000_000
-            marker_array.markers.append(sphere)
-            marker_id += 1
-
-            text = Marker()
-            text.header = det3d_array.header
-            text.ns = 'labels'
-            text.id = marker_id
-            text.type = Marker.TEXT_VIEW_FACING
-            text.action = Marker.ADD
-            text.pose.position.x = x
-            text.pose.position.y = y - 0.05
-            text.pose.position.z = z
-            text.pose.orientation.w = 1.0
-            text.scale.z = 0.03
-            text.color.r = 1.0
-            text.color.g = 1.0
-            text.color.b = 1.0
-            text.color.a = 1.0
-            text.text = f'{cls_name} ({z:.2f}m)'
-            text.lifetime.nanosec = 500_000_000
-            marker_array.markers.append(text)
-            marker_id += 1
-
-            self.get_logger().info(
-                f'{cls_name} at ({x:.3f}, {y:.3f}, {z:.3f})m conf={score:.2f}'
+            depth_m, quality = filter_depth_roi(
+                roi,
+                depth_scale=self.depth_scale,
+                min_valid_ratio=self.min_depth_valid_ratio,
+                outlier_sigma=self.outlier_sigma,
             )
 
+            if depth_m <= 0.0 or depth_m > self.max_depth_m or quality <= 0.0:
+                continue
+
+            # Project pixel → 3D
+            x, y, z = project_pixel_to_xyz(
+                u, v, depth_m, self.fx, self.fy, self.cx, self.cy
+            )
+
+            composite = compute_composite_score(score, quality)
+
+            candidates.append(TargetCandidate(
+                x=x, y=y, z=z,
+                class_name=cls_name,
+                confidence=score,
+                depth_quality=quality,
+                composite_score=composite,
+                source=det2d,
+            ))
+
+        # ---- Phase 2: Select best target ----
+        best = select_best_target(candidates)
+        if best is None:
+            return
+
+        # ---- Phase 3: Coordinate jump check ----
+        new_pos = (best.x, best.y, best.z)
+
+        # Reset stabilizer if target class changed
+        if best.class_name != self._prev_best_class:
+            self._stabilizer.reset()
+            self._prev_best_pos = None
+            self._prev_best_class = best.class_name
+
+        if detect_coordinate_jump(new_pos, self._prev_best_pos, self.jump_threshold_m):
+            self.get_logger().debug(
+                f'Jump detected: {best.class_name} {new_pos}, '
+                f'prev={self._prev_best_pos}, resetting tracker'
+            )
+            self._prev_best_pos = new_pos
+            self._stabilizer.reset()
+            return
+
+        self._prev_best_pos = new_pos
+
+        # ---- Phase 4: Coordinate stabilizer ----
+        stable = self._stabilizer.update(new_pos)
+        if stable is None:
+            return
+
+        sx, sy, sz = stable
+
+        # ---- Phase 5: Publish ----
+        det3d_array = Detection3DArray()
+        det3d_array.header.stamp = depth_msg.header.stamp
+        det3d_array.header.frame_id = depth_msg.header.frame_id or self.camera_frame
+
+        det3d = Detection3D()
+        det3d.header = det3d_array.header
+        det3d.id = f'{best.class_name}_stable'
+        det3d.bbox.center.position.x = sx
+        det3d.bbox.center.position.y = sy
+        det3d.bbox.center.position.z = sz
+        det3d.bbox.center.orientation.w = 1.0
+        det3d.bbox.size.x = 0.1
+        det3d.bbox.size.y = 0.1
+        det3d.bbox.size.z = 0.1
+
+        hyp = ObjectHypothesisWithPose()
+        hyp.hypothesis.class_id = best.class_name
+        hyp.hypothesis.score = best.confidence
+        hyp.pose.pose.position.x = sx
+        hyp.pose.pose.position.y = sy
+        hyp.pose.pose.position.z = sz
+        hyp.pose.pose.orientation.w = 1.0
+        det3d.results.append(hyp)
+        det3d_array.detections.append(det3d)
+
         self.pub_detections_3d.publish(det3d_array)
-        if tf_list:
-            self.tf_broadcaster.sendTransform(tf_list)
-        if marker_array.markers:
-            self.pub_markers.publish(marker_array)
+
+        # ---- TF + markers ----
+        t = TransformStamped()
+        t.header = det3d_array.header
+        t.child_frame_id = f'detected_{best.class_name}'
+        t.transform.translation.x = sx
+        t.transform.translation.y = sy
+        t.transform.translation.z = sz
+        t.transform.rotation.w = 1.0
+        self.tf_broadcaster.sendTransform([t])
+
+        marker_array = MarkerArray()
+
+        sphere = Marker()
+        sphere.header = det3d_array.header
+        sphere.ns = 'detections'
+        sphere.id = 0
+        sphere.type = Marker.SPHERE
+        sphere.action = Marker.ADD
+        sphere.pose.position.x = sx
+        sphere.pose.position.y = sy
+        sphere.pose.position.z = sz
+        sphere.pose.orientation.w = 1.0
+        sphere.scale.x = 0.05
+        sphere.scale.y = 0.05
+        sphere.scale.z = 0.05
+        sphere.color.g = 1.0
+        sphere.color.a = 0.8
+        sphere.lifetime.nanosec = 500_000_000
+        marker_array.markers.append(sphere)
+
+        text = Marker()
+        text.header = det3d_array.header
+        text.ns = 'labels'
+        text.id = 1
+        text.type = Marker.TEXT_VIEW_FACING
+        text.action = Marker.ADD
+        text.pose.position.x = sx
+        text.pose.position.y = sy - 0.05
+        text.pose.position.z = sz
+        text.pose.orientation.w = 1.0
+        text.scale.z = 0.03
+        text.color.r = 1.0
+        text.color.g = 1.0
+        text.color.b = 1.0
+        text.color.a = 1.0
+        text.text = f'{best.class_name} ({sz:.2f}m)'
+        text.lifetime.nanosec = 500_000_000
+        marker_array.markers.append(text)
+
+        self.pub_markers.publish(marker_array)
+
+        self.get_logger().info(
+            f'{best.class_name} stable at ({sx:.3f}, {sy:.3f}, {sz:.3f})m '
+            f'conf={best.confidence:.2f} q={best.depth_quality:.2f} '
+            f'score={best.composite_score:.2f}'
+        )
 
 
 def main(args=None):
