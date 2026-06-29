@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 *.egg-info/
 .cache/
+.pytest_tmp_review/
