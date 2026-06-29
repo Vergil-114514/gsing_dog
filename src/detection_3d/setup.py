@@ -27,6 +27,11 @@ setup(
             'yolo_detector = detection_3d.yolo_detector_node:main',
             'detection_3d_calculator = detection_3d.detection_3d_calculator_node:main',
             'arm_serial_bridge = detection_3d.arm_serial_bridge_node:main',
+            'coordinate_sample_logger = detection_3d.coordinate_sample_logger_node:main',
+            'evaluate_positions = detection_3d.evaluate_positions_csv:main',
+            'compare_positions = detection_3d.compare_positions_csv:main',
+            'benchmark_depth_estimator = detection_3d.depth_algorithm_benchmark:main',
+            'estimator_comparison_logger = detection_3d.estimator_comparison_logger_node:main',
         ],
     },
 )

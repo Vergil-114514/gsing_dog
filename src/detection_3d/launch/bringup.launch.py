@@ -31,6 +31,27 @@ def generate_launch_description():
         'use_arm_bridge', default_value='false',
         description='Launch arm serial bridge to STM32',
     )
+    use_sample_logger_arg = DeclareLaunchArgument(
+        'use_sample_logger', default_value='false',
+        description='Record stable 3D detection samples to CSV',
+    )
+    sample_output_path_arg = DeclareLaunchArgument(
+        'sample_output_path', default_value='detection_samples.csv',
+        description='CSV output path for coordinate samples',
+    )
+    use_estimator_comparison_logger_arg = DeclareLaunchArgument(
+        'use_estimator_comparison_logger', default_value='false',
+        description='Record same-frame center_median/cluster_centroid estimates to CSV',
+    )
+    estimator_comparison_output_path_arg = DeclareLaunchArgument(
+        'estimator_comparison_output_path',
+        default_value='estimator_comparison_samples.csv',
+        description='CSV output path for same-frame estimator comparison samples',
+    )
+    depth_estimator_mode_arg = DeclareLaunchArgument(
+        'depth_estimator_mode', default_value='cluster_centroid',
+        description='Depth estimator mode: cluster_centroid or center_median',
+    )
     input_topic_arg = DeclareLaunchArgument(
         'input_topic', default_value='/camera/color/image_raw',
         description='Color image topic for YOLO',
@@ -76,6 +97,7 @@ def generate_launch_description():
             'camera_info_topic': LaunchConfiguration('camera_info_topic'),
             'source_image_width': LaunchConfiguration('source_image_width'),
             'source_image_height': LaunchConfiguration('source_image_height'),
+            'depth_estimator_mode': LaunchConfiguration('depth_estimator_mode'),
         }],
         output='screen',
     )
@@ -91,6 +113,36 @@ def generate_launch_description():
         }],
         output='screen',
         condition=IfCondition(LaunchConfiguration('use_arm_bridge')),
+    )
+
+    # ---- Optional coordinate sample logger ----
+    sample_logger_node = Node(
+        package='detection_3d',
+        executable='coordinate_sample_logger',
+        name='coordinate_sample_logger',
+        parameters=[params_file, {
+            'output_path': LaunchConfiguration('sample_output_path'),
+            'target_class': LaunchConfiguration('target_class'),
+        }],
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('use_sample_logger')),
+    )
+
+    # ---- Optional same-frame estimator comparison logger ----
+    estimator_comparison_logger_node = Node(
+        package='detection_3d',
+        executable='estimator_comparison_logger',
+        name='estimator_comparison_logger',
+        parameters=[params_file, {
+            'output_path': LaunchConfiguration('estimator_comparison_output_path'),
+            'target_class': LaunchConfiguration('target_class'),
+            'depth_topic': LaunchConfiguration('depth_topic'),
+            'camera_info_topic': LaunchConfiguration('camera_info_topic'),
+            'source_image_width': LaunchConfiguration('source_image_width'),
+            'source_image_height': LaunchConfiguration('source_image_height'),
+        }],
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('use_estimator_comparison_logger')),
     )
 
     # ---- Optional RViz ----
@@ -109,6 +161,11 @@ def generate_launch_description():
         serial_port_arg,
         use_rviz_arg,
         use_arm_bridge_arg,
+        use_sample_logger_arg,
+        sample_output_path_arg,
+        use_estimator_comparison_logger_arg,
+        estimator_comparison_output_path_arg,
+        depth_estimator_mode_arg,
         input_topic_arg,
         depth_topic_arg,
         camera_info_topic_arg,
@@ -118,5 +175,7 @@ def generate_launch_description():
         yolo_node,
         calc_node,
         arm_bridge_node,
+        sample_logger_node,
+        estimator_comparison_logger_node,
         rviz_node,
     ])

@@ -1,27 +1,61 @@
 """
 ROS2 node: USB CDC serial bridge to STM32 MCU.
 
-Host -> MCU:  func 0x12 — camera-frame arm target XYZ
-MCU -> Host:  func 0x21 — 1-byte grasp/place flag (0=grasp, 1=place)
+Host -> MCU:  func 0x12, target_type + arm_base target xyz.
+MCU -> Host:  func 0x21, arm state + current end xyz + theta1.
 """
 
+from enum import Enum
 import glob
 import os
 import select
-import termios
 import time
 
-import rclpy
-from rclpy.node import Node
-from vision_msgs.msg import Detection3DArray
+try:
+    import termios
+except ImportError:  # pragma: no cover - Windows unit-test environment
+    termios = None
 
-from detection_3d.protocol import (
-    pack_arm_target_xyz,
-    parse_arm_flag,
-    FUNC_ARM_FLAG,
-)
-from detection_3d.target_filter import EMAFilter, StabilityFilter
+try:
+    import rclpy
+    from rclpy.node import Node
+except ImportError:  # pragma: no cover - unit tests without ROS2 installed
+    rclpy = None
+
+    class Node:  # type: ignore[no-redef]
+        """Placeholder so pure Python state-machine tests can import this file."""
+
+try:
+    from vision_msgs.msg import Detection3DArray
+except ImportError:  # pragma: no cover - unit tests without ROS2 messages
+    Detection3DArray = object  # type: ignore[assignment]
+
 from detection_3d.place_targets import validate_place_targets, get_place_target
+from detection_3d.protocol import (
+    ARM_STATE_ERROR,
+    FUNC_ARM_FEEDBACK,
+    TARGET_TYPE_GRASP,
+    TARGET_TYPE_PLACE,
+    ArmFeedback,
+    pack_arm_target,
+    parse_arm_feedback,
+)
+from detection_3d.target_filter import EMAFilter, StabilityFilter, distance
+from detection_3d.vision_transform import (
+    VisionTransformConfig,
+    transform_camera_to_arm_base,
+)
+
+
+class BridgeState(Enum):
+    """Host-side grasp/place state machine states."""
+
+    WAIT_DETECTION = 'WAIT_DETECTION'
+    SEND_GRASP = 'SEND_GRASP'
+    GRASP_DELAY = 'GRASP_DELAY'
+    SEND_PLACE = 'SEND_PLACE'
+    PLACE_DELAY = 'PLACE_DELAY'
+    ERROR = 'ERROR'
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +63,8 @@ from detection_3d.place_targets import validate_place_targets, get_place_target
 # ---------------------------------------------------------------------------
 
 class CdcSerial:
+    """Small Linux termios wrapper for STM32 USB CDC serial transport."""
+
     def __init__(self, port: str, baud_rate: int):
         self.requested_port = port
         self.baud_rate = baud_rate
@@ -37,9 +73,14 @@ class CdcSerial:
 
     @property
     def is_open(self) -> bool:
+        """Return whether the serial file descriptor is currently open."""
         return self.fd is not None
 
     def open(self):
+        """Open and configure the STM32 CDC serial port."""
+        if termios is None:
+            raise OSError('termios is unavailable; CDC serial requires Linux')
+
         self.close()
         self.port = self._resolve_port()
         self.fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -57,11 +98,13 @@ class CdcSerial:
         termios.tcflush(self.fd, termios.TCIOFLUSH)
 
     def close(self):
+        """Close the serial file descriptor if it is open."""
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
 
     def write(self, data: bytes) -> bool:
+        """Write a complete frame to the serial port."""
         if self.fd is None:
             raise OSError('serial port is not open')
         total = len(data)
@@ -80,6 +123,7 @@ class CdcSerial:
         return True
 
     def read_available(self, timeout_sec: float = 0.0, max_bytes: int = 512) -> bytes:
+        """Read currently available serial bytes without blocking the ROS timer."""
         if self.fd is None:
             return b''
         readable, _, _ = select.select([self.fd], [], [], timeout_sec)
@@ -108,6 +152,8 @@ class CdcSerial:
 
     @staticmethod
     def _termios_baud(baud_rate: int):
+        if termios is None:
+            raise OSError('termios is unavailable; CDC serial requires Linux')
         baud_name = f'B{baud_rate}'
         if not hasattr(termios, baud_name):
             raise ValueError(f'unsupported baud rate: {baud_rate}')
@@ -119,8 +165,12 @@ class CdcSerial:
 # ---------------------------------------------------------------------------
 
 class ArmSerialBridgeNode(Node):
+    """Bridge stable vision targets to MCU arm commands over USB CDC."""
 
     def __init__(self):
+        if rclpy is None:
+            raise RuntimeError('ArmSerialBridgeNode requires ROS2 rclpy')
+
         super().__init__('arm_serial_bridge')
 
         # ---- serial ----
@@ -139,6 +189,18 @@ class ArmSerialBridgeNode(Node):
         self.declare_parameter('max_send_rate', 3.0)
         self.declare_parameter('read_feedback', True)
 
+        # ---- host state-machine timing ----
+        self.declare_parameter('reach_tolerance_m', 0.015)
+        self.declare_parameter('reach_stable_frames', 3)
+        self.declare_parameter('arrival_delay_sec', 1.0)
+        self.declare_parameter('feedback_timeout_sec', 0.5)
+
+        # ---- vision camera -> arm base transform ----
+        self.declare_parameter('camera_to_arm_transform_enabled', True)
+        self.declare_parameter('camera_offset_x_m', 0.105)
+        self.declare_parameter('camera_offset_y_m', 0.0)
+        self.declare_parameter('camera_offset_z_m', -0.078)
+
         # ---- place targets ----
         self.declare_parameter('place_targets_m', [0.0, 0.0, 0.0])
         self.declare_parameter('place_target_index', 0)
@@ -155,6 +217,32 @@ class ArmSerialBridgeNode(Node):
         stable_frames = int(self.get_parameter('stable_frames').value)
         self.max_send_rate = float(self.get_parameter('max_send_rate').value)
         self.read_feedback = bool(self.get_parameter('read_feedback').value)
+        self.reach_tolerance_m = float(
+            self.get_parameter('reach_tolerance_m').value
+        )
+        self.reach_stable_frames = max(
+            1, int(self.get_parameter('reach_stable_frames').value)
+        )
+        self.arrival_delay_sec = float(
+            self.get_parameter('arrival_delay_sec').value
+        )
+        self.feedback_timeout_sec = float(
+            self.get_parameter('feedback_timeout_sec').value
+        )
+        self.camera_to_arm_transform_enabled = bool(
+            self.get_parameter('camera_to_arm_transform_enabled').value
+        )
+        if not self.camera_to_arm_transform_enabled:
+            self.get_logger().warn(
+                'camera_to_arm_transform_enabled=false is ignored; '
+                '0x12 targets must be sent in arm_base coordinates'
+            )
+            self.camera_to_arm_transform_enabled = True
+        self.vision_transform = VisionTransformConfig(
+            camera_offset_x_m=float(self.get_parameter('camera_offset_x_m').value),
+            camera_offset_y_m=float(self.get_parameter('camera_offset_y_m').value),
+            camera_offset_z_m=float(self.get_parameter('camera_offset_z_m').value),
+        )
 
         place_targets_m_raw = self.get_parameter('place_targets_m').value
         place_target_index = int(self.get_parameter('place_target_index').value)
@@ -173,11 +261,19 @@ class ArmSerialBridgeNode(Node):
         place_targets = validate_place_targets(place_targets_m_raw)
         self._place_target = get_place_target(place_targets, place_target_index)
 
-        # === MCU-driven state ===
-        self._grasp_place_flag: int = 0       # 0 = grasp, 1 = place
-        self._latest_stable_target: tuple[float, float, float] | None = None
+        # === host-driven state ===
+        self._bridge_state = BridgeState.WAIT_DETECTION
+        self._latest_stable_camera_target: tuple[float, float, float] | None = None
+        self._latest_feedback: ArmFeedback | None = None
+        self._last_feedback_time: float | None = None
+        self._active_target: tuple[float, float, float] | None = None
+        self._hold_target: tuple[float, float, float] | None = None
+        self._reach_count = 0
+        self._delay_start_time: float | None = None
+        self._last_feedback_warn_time = 0.0
+        self._last_serial_reopen_time = 0.0
 
-        # === rate limiting / state ===
+        # === rate limiting / tx state ===
         self.last_sent_target = None
         self.last_send_time = 0.0
 
@@ -199,6 +295,9 @@ class ArmSerialBridgeNode(Node):
             f'max_send_rate={self.max_send_rate}Hz, '
             f'ema_alpha={ema_alpha:.2f}, stable={stable_frames} frames, '
             f'target_class="{self.target_class or "any"}", '
+            f'reach_tolerance={self.reach_tolerance_m:.3f}m, '
+            f'feedback_timeout={self.feedback_timeout_sec:.2f}s, '
+            f'transform_enabled={self.camera_to_arm_transform_enabled}, '
             f'place=({self._place_target[0]:.3f}, '
             f'{self._place_target[1]:.3f}, '
             f'{self._place_target[2]:.3f})m'
@@ -236,7 +335,11 @@ class ArmSerialBridgeNode(Node):
     # ------------------------------------------------------------------
 
     def _read_and_parse_feedback(self):
-        if not self.read_feedback or not self.serial.is_open:
+        if not self.read_feedback:
+            return
+
+        if not self.serial.is_open:
+            self._try_reopen_serial_for_feedback(time.monotonic())
             return
 
         raw = self.serial.read_available(timeout_sec=0.0, max_bytes=512)
@@ -248,13 +351,20 @@ class ArmSerialBridgeNode(Node):
             if frame is None:
                 break
             func_id, payload = frame
-            if func_id == FUNC_ARM_FLAG:
-                self._handle_arm_flag(payload)
+            if func_id == FUNC_ARM_FEEDBACK:
+                self._handle_arm_feedback(payload)
             else:
                 self.get_logger().debug(
                     f'MCU frame func=0x{func_id:02X} '
                     f'payload={payload.hex(" ")} ({len(payload)}B)'
                 )
+
+    def _try_reopen_serial_for_feedback(self, now: float):
+        if now - self._last_serial_reopen_time < 1.0:
+            return
+        self._last_serial_reopen_time = now
+        self.get_logger().warn('Serial is closed; trying to reopen for feedback')
+        self._open_serial()
 
     def _try_parse_frame(self) -> tuple[int, bytes] | None:
         while len(self._rx_buffer) >= 5:
@@ -284,37 +394,30 @@ class ArmSerialBridgeNode(Node):
     # MCU -> Host frame handlers
     # ------------------------------------------------------------------
 
-    def _handle_arm_flag(self, payload: bytes):
+    def _handle_arm_feedback(self, payload: bytes):
         try:
-            flag = parse_arm_flag(payload)
+            feedback = parse_arm_feedback(payload)
         except ValueError as exc:
-            self.get_logger().warn(f'Bad 0x21 frame, dropping: {exc}')
+            self.get_logger().warn(f'Bad 0x21 feedback frame, dropping: {exc}')
             return
 
-        if flag not in (0, 1):
-            self.get_logger().warn(f'Unknown flag value {flag}, ignored')
-            return
+        self._latest_feedback = feedback
+        self._last_feedback_time = time.monotonic()
 
-        prev_flag = self._grasp_place_flag
-        if flag == prev_flag:
-            return
-
-        self._grasp_place_flag = flag
-        self.get_logger().info(
-            f'MCU flag: {prev_flag} -> {flag} '
-            f'({"grasp" if flag == 0 else "place"})'
-        )
-        if flag == 0:
-            self.ema.reset()
-            self.stability.reset()
-            self._latest_stable_target = None
+        if feedback.arm_state == ARM_STATE_ERROR:
+            self._set_state(BridgeState.ERROR)
+            self.get_logger().error('MCU arm_state=error; stop sending targets')
 
     # ------------------------------------------------------------------
-    # Detection filtering (camera-frame coords, no FK)
+    # Detection filtering
     # ------------------------------------------------------------------
 
     def detection_callback(self, msg: Detection3DArray):
-        if self._grasp_place_flag != 0:
+        """Cache only stable camera-frame targets from the vision pipeline."""
+        if self._bridge_state not in (
+            BridgeState.WAIT_DETECTION,
+            BridgeState.SEND_GRASP,
+        ):
             return
         if not msg.detections:
             return
@@ -341,35 +444,132 @@ class ArmSerialBridgeNode(Node):
         filtered = self.ema.update(raw_camera)
         stable = self.stability.update(filtered)
         if stable is not None:
-            self._latest_stable_target = stable
+            self._latest_stable_camera_target = stable
+            if self._bridge_state == BridgeState.WAIT_DETECTION:
+                self._active_target = None
+                self._hold_target = None
+                self._reach_count = 0
+                self._set_state(BridgeState.SEND_GRASP)
 
     # ------------------------------------------------------------------
-    # Timer — send based on MCU flag
+    # Timer state machine
     # ------------------------------------------------------------------
 
     def send_timer_callback(self):
+        """Drive the host-side grasp/place state machine on each timer tick."""
         self._read_and_parse_feedback()
 
-        if self._grasp_place_flag == 0:
-            self._maybe_send_grasp()
-        elif self._grasp_place_flag == 1:
-            self._maybe_send_place()
+        now = time.monotonic()
+        if self._bridge_state == BridgeState.ERROR:
+            return
+        if self._bridge_state == BridgeState.WAIT_DETECTION:
+            return
+        if self._bridge_state == BridgeState.SEND_GRASP:
+            self._maybe_send_grasp(now)
+        elif self._bridge_state == BridgeState.GRASP_DELAY:
+            self._send_delay_hold(
+                now,
+                target_type=TARGET_TYPE_GRASP,
+                tag='grasp_hold',
+                next_state=BridgeState.SEND_PLACE,
+            )
+        elif self._bridge_state == BridgeState.SEND_PLACE:
+            self._maybe_send_place(now)
+        elif self._bridge_state == BridgeState.PLACE_DELAY:
+            self._send_delay_hold(
+                now,
+                target_type=TARGET_TYPE_PLACE,
+                tag='place_hold',
+                next_state=BridgeState.WAIT_DETECTION,
+            )
 
-    def _maybe_send_grasp(self):
-        if self._latest_stable_target is not None:
-            self._send_target_immediate(self._latest_stable_target, 'grasp')
+    def _maybe_send_grasp(self, now: float):
+        if self._latest_stable_camera_target is None:
+            return
+        if not self._has_fresh_feedback(now):
+            self._warn_feedback_timeout(now)
+            return
+        if self._latest_feedback is None:
+            return
 
-    def _maybe_send_place(self):
-        self._send_target_immediate(self._place_target, 'place')
+        target = transform_camera_to_arm_base(
+            self._latest_stable_camera_target,
+            self.vision_transform,
+            theta1_rad=self._latest_feedback.theta1_rad,
+            current_end_xyz_m=self._latest_feedback.end_xyz_m,
+        )
+
+        if self._send_target_immediate(
+            target, target_type=TARGET_TYPE_GRASP, tag='grasp', now=now
+        ):
+            self._active_target = target
+            self._hold_target = target
+            self._update_arrival(
+                now,
+                target,
+                reached_state=BridgeState.GRASP_DELAY,
+            )
+
+    def _maybe_send_place(self, now: float):
+        target = self._place_target
+        if self._send_target_immediate(
+            target, target_type=TARGET_TYPE_PLACE, tag='place', now=now
+        ):
+            self._active_target = target
+            self._hold_target = target
+            self._update_arrival(
+                now,
+                target,
+                reached_state=BridgeState.PLACE_DELAY,
+            )
+
+    def _send_delay_hold(
+        self,
+        now: float,
+        target_type: int,
+        tag: str,
+        next_state: BridgeState,
+    ):
+        target = self._hold_target
+        if target is None:
+            target = (
+                self._place_target
+                if target_type == TARGET_TYPE_PLACE
+                else self._active_target
+            )
+        if target is not None:
+            self._send_target_immediate(
+                target,
+                target_type=target_type,
+                tag=tag,
+                now=now,
+            )
+
+        if self._delay_start_time is None:
+            self._delay_start_time = now
+        if now - self._delay_start_time < self.arrival_delay_sec:
+            return
+
+        if next_state == BridgeState.WAIT_DETECTION:
+            self._reset_detection_state()
+        self._set_state(next_state)
+        self._reach_count = 0
+        self._delay_start_time = None
+        self._active_target = None
+        self._hold_target = None
 
     # ------------------------------------------------------------------
     # Send helpers
     # ------------------------------------------------------------------
 
     def _send_target_immediate(
-        self, target: tuple[float, float, float], tag: str
+        self,
+        target: tuple[float, float, float],
+        target_type: int,
+        tag: str,
+        now: float | None = None,
     ) -> bool:
-        now = time.monotonic()
+        now = time.monotonic() if now is None else now
         min_interval = 1.0 / max(self.max_send_rate, 0.1)
         if now - self.last_send_time < min_interval:
             self.get_logger().debug(
@@ -377,26 +577,79 @@ class ArmSerialBridgeNode(Node):
             )
             return False
 
-        frame = pack_arm_target_xyz(target[0], target[1], target[2])
+        frame = pack_arm_target(target_type, target[0], target[1], target[2])
         if not self._write_frame(frame):
             return False
 
         self.last_sent_target = target
         self.last_send_time = now
         self.get_logger().info(
-            f'Sent {tag} ({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})m'
+            f'Sent {tag} type={target_type} '
+            f'({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})m'
         )
         return True
+
+    def _has_fresh_feedback(self, now: float) -> bool:
+        if self._latest_feedback is None or self._last_feedback_time is None:
+            return False
+        return now - self._last_feedback_time <= self.feedback_timeout_sec
+
+    def _warn_feedback_timeout(self, now: float):
+        if now - self._last_feedback_warn_time < 1.0:
+            return
+        self._last_feedback_warn_time = now
+        self.get_logger().warn(
+            'No fresh MCU feedback; grasp target is not sent'
+        )
+
+    def _update_arrival(
+        self,
+        now: float,
+        target: tuple[float, float, float],
+        reached_state: BridgeState,
+    ):
+        if not self._has_fresh_feedback(now) or self._latest_feedback is None:
+            self._reach_count = 0
+            return
+
+        dist_m = distance(self._latest_feedback.end_xyz_m, target)
+        if dist_m <= self.reach_tolerance_m:
+            self._reach_count += 1
+        else:
+            self._reach_count = 0
+
+        if self._reach_count >= self.reach_stable_frames:
+            self._delay_start_time = now
+            self._hold_target = target
+            self._reach_count = 0
+            self._set_state(reached_state)
+
+    def _set_state(self, state: BridgeState):
+        if self._bridge_state == state:
+            return
+        prev = self._bridge_state
+        self._bridge_state = state
+        self.get_logger().info(f'Arm bridge state: {prev.value} -> {state.value}')
+
+    def _reset_detection_state(self):
+        self.ema.reset()
+        self.stability.reset()
+        self._latest_stable_camera_target = None
 
     # ------------------------------------------------------------------
 
     def destroy_node(self):
+        """Close CDC serial before shutting down the ROS node."""
         self.serial.close()
         self.get_logger().info('Serial closed')
         super().destroy_node()
 
 
 def main(args=None):
+    """Run the arm serial bridge ROS2 node."""
+    if rclpy is None:
+        raise RuntimeError('arm_serial_bridge_node requires ROS2 rclpy')
+
     rclpy.init(args=args)
     node = ArmSerialBridgeNode()
     try:

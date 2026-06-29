@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from detection_3d.depth_processor import (
     compute_roi_size,
+    estimate_target_point_from_roi,
     extract_roi,
     filter_depth_roi,
 )
@@ -138,3 +139,156 @@ class TestFilterDepthRoi:
         ], dtype=np.uint16)
         _, quality = filter_depth_roi(roi, depth_scale=0.001)
         assert 0.0 < quality < 0.5
+
+
+# ---------------------------------------------------------------------------
+# estimate_target_point_from_roi
+# ---------------------------------------------------------------------------
+
+class TestEstimateTargetPointFromRoi:
+    def test_shifted_cluster_is_more_accurate_than_roi_center(self):
+        """Depth-cluster centroid beats fixed ROI-center projection."""
+        roi = np.full((7, 7), 3000, dtype=np.uint16)
+        roi[0:6, 2:7] = 1000
+
+        estimate = estimate_target_point_from_roi(
+            roi,
+            depth_scale=0.001,
+            min_valid_ratio=0.3,
+            cluster_tolerance_m=0.03,
+        )
+
+        assert estimate is not None
+        assert estimate.depth_m == pytest.approx(1.0)
+
+        roi_center = (3.0, 3.0)
+        expected_cluster_center = (4.0, 2.5)
+        estimated_center = (
+            roi_center[0] + estimate.offset_x_px,
+            roi_center[1] + estimate.offset_y_px,
+        )
+
+        baseline_error = np.linalg.norm(np.array(roi_center) - np.array(expected_cluster_center))
+        estimated_error = np.linalg.norm(
+            np.array(estimated_center) - np.array(expected_cluster_center)
+        )
+        assert estimated_error < baseline_error * 0.25
+
+    def test_center_depth_hole_still_estimates_surface(self):
+        """A missing center depth pixel should not invalidate the target point."""
+        roi = np.full((5, 5), 800, dtype=np.uint16)
+        roi[2, 2] = 0
+
+        estimate = estimate_target_point_from_roi(
+            roi,
+            depth_scale=0.001,
+            min_valid_ratio=0.3,
+        )
+
+        assert estimate is not None
+        assert estimate.depth_m == pytest.approx(0.8)
+        assert abs(estimate.offset_x_px) < 0.1
+        assert abs(estimate.offset_y_px) < 0.1
+        assert estimate.quality > 0.8
+
+    def test_foreground_cluster_can_win_when_background_is_majority(self):
+        """Nearest reliable cluster beats median depth when background dominates."""
+        roi = np.full((7, 7), 3000, dtype=np.uint16)
+        roi[1:4, 1:4] = 1000
+
+        median_depth_m, _ = filter_depth_roi(
+            roi,
+            depth_scale=0.001,
+            min_valid_ratio=0.3,
+        )
+        estimate = estimate_target_point_from_roi(
+            roi,
+            depth_scale=0.001,
+            min_valid_ratio=0.3,
+            cluster_tolerance_m=0.03,
+            min_cluster_ratio=0.15,
+        )
+
+        assert median_depth_m == pytest.approx(3.0)
+        assert estimate is not None
+        assert estimate.depth_m == pytest.approx(1.0)
+        assert estimate.cluster_ratio == pytest.approx(9 / 49)
+
+    def test_sparse_near_speckles_are_not_selected_as_target(self):
+        """A tiny near-depth cluster is treated as noise, not foreground."""
+        roi = np.full((7, 7), 3000, dtype=np.uint16)
+        roi[1, 1] = 500
+        roi[1, 2] = 500
+
+        estimate = estimate_target_point_from_roi(
+            roi,
+            depth_scale=0.001,
+            min_valid_ratio=0.3,
+            cluster_tolerance_m=0.03,
+            min_cluster_ratio=0.15,
+        )
+
+        assert estimate is not None
+        assert estimate.depth_m == pytest.approx(3.0)
+
+    def test_disconnected_same_depth_noise_does_not_bias_centroid(self):
+        """Same-depth disconnected noise should not pull the target centroid."""
+        roi = np.full((9, 9), 3000, dtype=np.uint16)
+        roi[1:6, 4:8] = 1000
+        roi[7:9, 0:2] = 1000
+
+        estimate = estimate_target_point_from_roi(
+            roi,
+            depth_scale=0.001,
+            min_valid_ratio=0.3,
+            cluster_tolerance_m=0.03,
+            min_cluster_ratio=0.15,
+        )
+
+        assert estimate is not None
+        assert estimate.depth_m == pytest.approx(1.0)
+
+        roi_center = (4.0, 4.0)
+        expected_target_center = (5.5, 3.0)
+        estimated_center = (
+            roi_center[0] + estimate.offset_x_px,
+            roi_center[1] + estimate.offset_y_px,
+        )
+
+        assert estimated_center == pytest.approx(expected_target_center)
+        assert estimate.cluster_ratio == pytest.approx(20 / 81)
+
+    def test_many_disconnected_near_pixels_do_not_form_reliable_cluster(self):
+        """Disconnected near pixels should not pass as one reliable target."""
+        roi = np.full((9, 9), 3000, dtype=np.uint16)
+        near_points = [
+            (0, 0), (0, 2), (0, 4), (0, 6), (0, 8),
+            (2, 0), (2, 2), (2, 4), (2, 6),
+            (4, 0), (4, 2), (4, 4), (4, 6),
+        ]
+        for y, x in near_points:
+            roi[y, x] = 1000
+
+        estimate = estimate_target_point_from_roi(
+            roi,
+            depth_scale=0.001,
+            min_valid_ratio=0.3,
+            cluster_tolerance_m=0.03,
+            min_cluster_ratio=0.15,
+        )
+
+        assert estimate is not None
+        assert estimate.depth_m == pytest.approx(3.0)
+
+    def test_rejects_roi_with_too_few_valid_pixels(self):
+        roi = np.zeros((5, 5), dtype=np.uint16)
+        roi[1, 1] = 900
+        roi[1, 2] = 900
+
+        estimate = estimate_target_point_from_roi(
+            roi,
+            depth_scale=0.001,
+            min_valid_ratio=0.3,
+        )
+
+        assert estimate is None

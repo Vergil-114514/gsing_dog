@@ -19,7 +19,7 @@ yolo_detector:
 detection_3d_calculator:
   ros__parameters:
     depth_scale: 0.001
-    sync_slop: 1.0
+    sync_slop: 0.15
     depth_roi_size: 5
     camera_frame: "camera_link"
     depth_topic: "/camera/depth/image_raw"
@@ -36,11 +36,37 @@ detection_3d_calculator:
     min_depth_valid_ratio: 0.3
     depth_roi_ratio: 0.3
     depth_outlier_sigma: 2.0
+    depth_cluster_tolerance_m: 0.03
+    depth_min_cluster_ratio: 0.15
+    depth_estimator_mode: "cluster_centroid"
 
     # ---- coordinate stability ----
-    max_depth_variance_m2: 0.01
+    max_depth_variance_m2: 0.0004
     coordinate_jump_threshold_m: 0.05
     stable_window_size: 5
+
+# ============================================
+# Estimator Comparison Logger Parameters
+# ============================================
+estimator_comparison_logger:
+  ros__parameters:
+    output_path: "estimator_comparison_samples.csv"
+    append: false
+    target_class: ""
+    depth_scale: 0.001
+    sync_slop: 0.15
+    depth_roi_size: 5
+    depth_topic: "/camera/depth/image_raw"
+    detection_topic: "/detection/detections_2d"
+    camera_info_topic: "/camera/depth/camera_info"
+    source_image_width: 640
+    source_image_height: 480
+    max_depth_m: 10.0
+    min_depth_valid_ratio: 0.3
+    depth_roi_ratio: 0.3
+    depth_outlier_sigma: 2.0
+    depth_cluster_tolerance_m: 0.03
+    depth_min_cluster_ratio: 0.15
 
 # ============================================
 # Arm Serial Bridge Parameters
@@ -57,6 +83,14 @@ arm_serial_bridge:
     stable_frames: 3
     max_send_rate: 5.0
     read_feedback: true
+    reach_tolerance_m: 0.015
+    reach_stable_frames: 3
+    arrival_delay_sec: 1.0
+    feedback_timeout_sec: 0.5
+    camera_to_arm_transform_enabled: true
+    camera_offset_x_m: 0.105
+    camera_offset_y_m: 0.0
+    camera_offset_z_m: -0.078
 
     # Place target in arm_base frame, meters (÷1000 from MCU mm coords)
     # Flat array: [x1, y1, z1,  x2, y2, z2, ...]

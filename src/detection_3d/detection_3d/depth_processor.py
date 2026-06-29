@@ -4,7 +4,27 @@ Adaptive ROI depth extraction with outlier rejection and quality scoring.
 All functions are pure (no side effects), making them easy to unit-test.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
+
+
+@dataclass(frozen=True)
+class DepthEstimate:
+    """
+    Estimated target surface inside a depth ROI.
+
+    offset_x_px / offset_y_px are relative to the ROI center. They let callers
+    project the depth-cluster centroid instead of blindly projecting the YOLO
+    box center.
+    """
+
+    depth_m: float
+    quality: float
+    offset_x_px: float
+    offset_y_px: float
+    valid_ratio: float
+    cluster_ratio: float
 
 
 def compute_roi_size(
@@ -115,3 +135,147 @@ def filter_depth_roi(
     quality = valid_ratio * stability
 
     return depth_m, float(np.clip(quality, 0.0, 1.0))
+
+
+def _largest_connected_component(mask: np.ndarray) -> np.ndarray:
+    h, w = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    best_component: list[tuple[int, int]] = []
+
+    for start_y, start_x in zip(*np.nonzero(mask)):
+        if visited[start_y, start_x]:
+            continue
+
+        stack = [(int(start_y), int(start_x))]
+        visited[start_y, start_x] = True
+        component: list[tuple[int, int]] = []
+
+        while stack:
+            y, x = stack.pop()
+            component.append((y, x))
+
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny = y + dy
+                    nx = x + dx
+                    if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                        continue
+                    if visited[ny, nx] or not mask[ny, nx]:
+                        continue
+                    visited[ny, nx] = True
+                    stack.append((ny, nx))
+
+        if len(component) > len(best_component):
+            best_component = component
+
+    component_mask = np.zeros_like(mask, dtype=bool)
+    for y, x in best_component:
+        component_mask[y, x] = True
+    return component_mask
+
+
+def estimate_target_point_from_roi(
+    roi: np.ndarray,
+    depth_scale: float = 0.001,
+    min_valid_ratio: float = 0.3,
+    outlier_sigma: float = 2.0,
+    cluster_tolerance_m: float = 0.03,
+    min_cluster_ratio: float = 0.15,
+) -> DepthEstimate | None:
+    """
+    Estimate target depth and pixel centroid from a depth ROI.
+
+    The existing center-point algorithm assumes the YOLO box center is the
+    target point. This estimator finds the closest reliable depth cluster, then
+    computes the centroid of pixels that belong to that cluster. That is more
+    accurate when the box center is biased, contains depth holes, or includes
+    background pixels behind the target.
+
+    Args:
+        roi: 2D depth array.
+        depth_scale: Raw depth unit to meters.
+        min_valid_ratio: Minimum ratio of non-zero depth pixels.
+        outlier_sigma: Robust spread multiplier used for the depth cluster.
+        cluster_tolerance_m: Depth gap used to split foreground/background clusters.
+        min_cluster_ratio: Minimum valid-pixel ratio for a reliable depth cluster.
+
+    Returns:
+        DepthEstimate or None if the ROI has too little reliable depth.
+    """
+    valid_mask = roi > 0
+    valid_count = int(valid_mask.sum())
+    total_count = int(roi.size)
+    valid_ratio = valid_count / total_count if total_count > 0 else 0.0
+    if valid_ratio < min_valid_ratio or valid_count < 3:
+        return None
+
+    depth_m = roi.astype(np.float64) * depth_scale
+    valid_depths = depth_m[valid_mask]
+    sorted_depths = np.sort(valid_depths)
+    tolerance_m = max(float(cluster_tolerance_m), 1e-6)
+    min_cluster_count = max(3, int(np.ceil(valid_count * max(0.0, min_cluster_ratio))))
+
+    clusters: list[tuple[int, int]] = []
+    start = 0
+    for idx in range(1, len(sorted_depths)):
+        if sorted_depths[idx] - sorted_depths[idx - 1] > tolerance_m:
+            clusters.append((start, idx))
+            start = idx
+    clusters.append((start, len(sorted_depths)))
+
+    selected_mask: np.ndarray | None = None
+    for start, end in clusters:
+        cluster = sorted_depths[start:end]
+        if len(cluster) < min_cluster_count:
+            continue
+        cluster_min = float(cluster[0] - tolerance_m)
+        cluster_max = float(cluster[-1] + tolerance_m)
+        cluster_mask = valid_mask & (depth_m >= cluster_min) & (depth_m <= cluster_max)
+        cluster_mask = _largest_connected_component(cluster_mask)
+        if int(cluster_mask.sum()) >= min_cluster_count:
+            selected_mask = cluster_mask
+            break
+
+    if selected_mask is None:
+        anchor_depth_m, base_quality = filter_depth_roi(
+            roi,
+            depth_scale=depth_scale,
+            min_valid_ratio=min_valid_ratio,
+            outlier_sigma=outlier_sigma,
+        )
+        if anchor_depth_m <= 0.0 or base_quality <= 0.0:
+            return None
+        cluster_min = float(anchor_depth_m - tolerance_m)
+        cluster_max = float(anchor_depth_m + tolerance_m)
+        selected_mask = valid_mask & (depth_m >= cluster_min) & (depth_m <= cluster_max)
+        selected_mask = _largest_connected_component(selected_mask)
+
+    cluster_count = int(selected_mask.sum())
+    if cluster_count < 3:
+        return None
+
+    ys, xs = np.nonzero(selected_mask)
+    cluster_depths = depth_m[selected_mask]
+    cluster_depth_m = float(np.median(cluster_depths))
+
+    center_x = (roi.shape[1] - 1) / 2.0
+    center_y = (roi.shape[0] - 1) / 2.0
+    offset_x = float(np.mean(xs) - center_x)
+    offset_y = float(np.mean(ys) - center_y)
+
+    cluster_ratio = cluster_count / valid_count
+    mean_depth = float(np.mean(cluster_depths))
+    cv = float(np.std(cluster_depths) / mean_depth) if mean_depth > 0 else 1.0
+    stability = max(0.0, 1.0 - cv)
+    quality = valid_ratio * cluster_ratio * stability
+
+    return DepthEstimate(
+        depth_m=cluster_depth_m,
+        quality=float(np.clip(quality, 0.0, 1.0)),
+        offset_x_px=offset_x,
+        offset_y_px=offset_y,
+        valid_ratio=valid_ratio,
+        cluster_ratio=cluster_ratio,
+    )

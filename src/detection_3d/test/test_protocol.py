@@ -1,11 +1,16 @@
 import struct
+
 import pytest
+
 from detection_3d.protocol import (
+    ARM_STATE_MOVING,
+    FUNC_ARM_FEEDBACK,
+    FUNC_ARM_TARGET,
+    TARGET_TYPE_GRASP,
+    TARGET_TYPE_PLACE,
     build_frame,
-    pack_arm_target_xyz,
-    parse_arm_flag,
-    FUNC_ARM_TARGET_XYZ,
-    FUNC_ARM_FLAG,
+    pack_arm_target,
+    parse_arm_feedback,
 )
 
 
@@ -15,14 +20,14 @@ def test_build_frame_checksum():
     assert frame[0] == 0x55
     assert frame[1] == 0xAA
     assert frame[2] == 0x12
-    assert frame[3] == 12  # 3 * float32
+    assert frame[3] == 12
     expected_checksum = sum(frame[:-1]) & 0xFF
     assert frame[-1] == expected_checksum
 
 
 def test_build_frame_empty_payload():
     frame = build_frame(0x12, b'')
-    assert len(frame) == 5  # 4 header + 1 checksum
+    assert len(frame) == 5
     assert frame[3] == 0
 
 
@@ -33,49 +38,41 @@ def test_build_frame_checksum_zero_sum():
     assert frame[-1] == expected
 
 
-# ---- func 0x12: pack_arm_target_xyz ----
-
-def test_pack_arm_target_xyz_payload_length():
-    frame = pack_arm_target_xyz(1.0, 2.0, 3.0)
-    # 4 header + 12 payload + 1 checksum = 17 bytes
-    assert len(frame) == 17
-    assert frame[2] == FUNC_ARM_TARGET_XYZ
-    assert frame[3] == 12  # 3×f32
+def test_pack_arm_target_payload_and_frame_length():
+    frame = pack_arm_target(TARGET_TYPE_GRASP, 1.0, 2.0, 3.0)
+    assert len(frame) == 18
+    assert frame[2] == FUNC_ARM_TARGET
+    assert frame[3] == 13
 
 
-def test_pack_arm_target_xyz_roundtrip():
+def test_pack_arm_target_roundtrip():
     x, y, z = 0.5, -0.25, 1.75
-    frame = pack_arm_target_xyz(x, y, z)
-    payload = frame[4:-1]
-    rx, ry, rz = struct.unpack('<fff', payload)
+    frame = pack_arm_target(TARGET_TYPE_PLACE, x, y, z)
+    target_type, rx, ry, rz = struct.unpack('<Bfff', frame[4:-1])
+
+    assert target_type == TARGET_TYPE_PLACE
     assert rx == pytest.approx(x)
     assert ry == pytest.approx(y)
     assert rz == pytest.approx(z)
 
 
-def test_pack_arm_target_xyz_values():
-    frame = pack_arm_target_xyz(1.0, 2.0, 3.0)
-    payload = frame[4:-1]
-    rx, ry, rz = struct.unpack('<fff', payload)
-    assert rx == pytest.approx(1.0)
-    assert ry == pytest.approx(2.0)
-    assert rz == pytest.approx(3.0)
+def test_pack_arm_target_rejects_unknown_type():
+    with pytest.raises(ValueError, match='unsupported arm target type'):
+        pack_arm_target(99, 1.0, 2.0, 3.0)
 
 
-# ---- func 0x21: parse_arm_flag ----
+def test_parse_arm_feedback_roundtrip():
+    payload = struct.pack('<Bffff', ARM_STATE_MOVING, 0.1, -0.2, 0.3, 1.57)
 
-def test_parse_arm_flag_grasp():
-    flag = parse_arm_flag(bytes([0]))
-    assert flag == 0
+    feedback = parse_arm_feedback(payload)
 
-
-def test_parse_arm_flag_place():
-    flag = parse_arm_flag(bytes([1]))
-    assert flag == 1
+    assert feedback.arm_state == ARM_STATE_MOVING
+    assert feedback.end_xyz_m == pytest.approx((0.1, -0.2, 0.3))
+    assert feedback.theta1_rad == pytest.approx(1.57)
 
 
-def test_parse_arm_flag_invalid_length():
-    with pytest.raises(ValueError, match="Expected 1-byte"):
-        parse_arm_flag(b'')
-    with pytest.raises(ValueError, match="Expected 1-byte"):
-        parse_arm_flag(bytes([0, 0]))
+def test_parse_arm_feedback_invalid_length():
+    with pytest.raises(ValueError, match='Expected 17-byte payload'):
+        parse_arm_feedback(b'')
+    with pytest.raises(ValueError, match='Expected 17-byte payload'):
+        parse_arm_feedback(bytes([FUNC_ARM_FEEDBACK]))

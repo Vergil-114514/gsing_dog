@@ -30,6 +30,10 @@ def generate_launch_description():
         'use_arm_bridge', default_value='false',
         description='Launch arm serial bridge to STM32',
     )
+    depth_estimator_mode_arg = DeclareLaunchArgument(
+        'depth_estimator_mode', default_value='cluster_centroid',
+        description='Depth estimator mode: cluster_centroid or center_median',
+    )
     source_w_arg = DeclareLaunchArgument(
         'source_image_width', default_value='640',
         description='Source RGB image width used for YOLO inference',
@@ -45,6 +49,7 @@ def generate_launch_description():
         depth_topic_arg,
         camera_info_topic_arg,
         use_arm_bridge_arg,
+        depth_estimator_mode_arg,
         source_w_arg,
         source_h_arg,
         Node(
@@ -66,6 +71,7 @@ def generate_launch_description():
                 'camera_info_topic': LaunchConfiguration('camera_info_topic'),
                 'source_image_width': LaunchConfiguration('source_image_width'),
                 'source_image_height': LaunchConfiguration('source_image_height'),
+                'depth_estimator_mode': LaunchConfiguration('depth_estimator_mode'),
             }],
             output='screen',
         ),

@@ -28,6 +28,7 @@ from detection_3d.geometry import project_pixel_to_xyz
 from detection_3d.depth_processor import (
     compute_roi_size,
     extract_roi,
+    estimate_target_point_from_roi,
     filter_depth_roi,
 )
 from detection_3d.target_selector import (
@@ -63,6 +64,9 @@ class Detection3DCalculatorNode(Node):
         self.declare_parameter('min_depth_valid_ratio', 0.3)
         self.declare_parameter('depth_roi_ratio', 0.3)
         self.declare_parameter('depth_outlier_sigma', 2.0)
+        self.declare_parameter('depth_cluster_tolerance_m', 0.03)
+        self.declare_parameter('depth_min_cluster_ratio', 0.15)
+        self.declare_parameter('depth_estimator_mode', 'cluster_centroid')
 
         # ---- new: stability ----
         self.declare_parameter('max_depth_variance_m2', 0.01)
@@ -87,6 +91,21 @@ class Detection3DCalculatorNode(Node):
         self.min_depth_valid_ratio = float(self.get_parameter('min_depth_valid_ratio').value)
         self.depth_roi_ratio = float(self.get_parameter('depth_roi_ratio').value)
         self.outlier_sigma = float(self.get_parameter('depth_outlier_sigma').value)
+        self.depth_cluster_tolerance_m = float(
+            self.get_parameter('depth_cluster_tolerance_m').value
+        )
+        self.depth_min_cluster_ratio = float(
+            self.get_parameter('depth_min_cluster_ratio').value
+        )
+        self.depth_estimator_mode = str(
+            self.get_parameter('depth_estimator_mode').value
+        ).strip().lower()
+        if self.depth_estimator_mode not in ('cluster_centroid', 'center_median'):
+            self.get_logger().warning(
+                f'Unknown depth_estimator_mode={self.depth_estimator_mode!r}; '
+                'using cluster_centroid'
+            )
+            self.depth_estimator_mode = 'cluster_centroid'
 
         self.max_depth_variance_m2 = float(self.get_parameter('max_depth_variance_m2').value)
         self.jump_threshold_m = float(self.get_parameter('coordinate_jump_threshold_m').value)
@@ -136,6 +155,9 @@ class Detection3DCalculatorNode(Node):
             f'Detection3DCalculator ready. depth_scale={self.depth_scale}, '
             f'roi_ratio={self.depth_roi_ratio}, min_roi={self.min_roi}, '
             f'outlier_sigma={self.outlier_sigma}, '
+            f'estimator={self.depth_estimator_mode}, '
+            f'cluster_tol={self.depth_cluster_tolerance_m}m, '
+            f'min_cluster_ratio={self.depth_min_cluster_ratio}, '
             f'valid_ratio>={self.min_depth_valid_ratio}, '
             f'stable_window={stable_window_size}, jump_thresh={self.jump_threshold_m}m, '
             f'source_res={self.source_w}x{self.source_h}'
@@ -185,8 +207,8 @@ class Detection3DCalculatorNode(Node):
             score = float(det2d.results[0].hypothesis.score)
 
             # Adaptive ROI based on detection box size
-            box_w = det2d.bbox.size_x
-            box_h = det2d.bbox.size_y
+            box_w = det2d.bbox.size_x * scale_x
+            box_h = det2d.bbox.size_y * scale_y
             roi_size = compute_roi_size(box_w, box_h, self.depth_roi_ratio, self.min_roi)
 
             # Center in depth image coordinates
@@ -201,19 +223,42 @@ class Detection3DCalculatorNode(Node):
             if roi is None:
                 continue
 
-            depth_m, quality = filter_depth_roi(
-                roi,
-                depth_scale=self.depth_scale,
-                min_valid_ratio=self.min_depth_valid_ratio,
-                outlier_sigma=self.outlier_sigma,
-            )
+            target_offset_x = 0.0
+            target_offset_y = 0.0
+            if self.depth_estimator_mode == 'center_median':
+                depth_m, quality = filter_depth_roi(
+                    roi,
+                    depth_scale=self.depth_scale,
+                    min_valid_ratio=self.min_depth_valid_ratio,
+                    outlier_sigma=self.outlier_sigma,
+                )
+            else:
+                estimate = estimate_target_point_from_roi(
+                    roi,
+                    depth_scale=self.depth_scale,
+                    min_valid_ratio=self.min_depth_valid_ratio,
+                    outlier_sigma=self.outlier_sigma,
+                    cluster_tolerance_m=self.depth_cluster_tolerance_m,
+                    min_cluster_ratio=self.depth_min_cluster_ratio,
+                )
+
+                if estimate is None:
+                    continue
+
+                depth_m = estimate.depth_m
+                quality = estimate.quality
+                target_offset_x = estimate.offset_x_px
+                target_offset_y = estimate.offset_y_px
 
             if depth_m <= 0.0 or depth_m > self.max_depth_m or quality <= 0.0:
                 continue
 
-            # Project pixel → 3D
+            target_u = u + target_offset_x
+            target_v = v + target_offset_y
+
+            # Project depth-cluster centroid to 3D
             x, y, z = project_pixel_to_xyz(
-                u, v, depth_m, self.fx, self.fy, self.cx, self.cy
+                target_u, target_v, depth_m, self.fx, self.fy, self.cx, self.cy
             )
 
             composite = compute_composite_score(score, quality)
