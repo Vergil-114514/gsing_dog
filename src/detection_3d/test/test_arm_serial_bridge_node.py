@@ -5,6 +5,9 @@ from detection_3d.protocol import (
     ARM_STATE_ERROR,
     ARM_STATE_MOVING,
     ArmFeedback,
+    FUNC_PUMP_CONTROL,
+    PUMP_OFF,
+    PUMP_ON,
     TARGET_TYPE_GRASP,
     TARGET_TYPE_PLACE,
 )
@@ -77,6 +80,7 @@ def _make_node() -> ArmSerialBridgeNode:
     node._hold_target = None
     node._reach_count = 0
     node._delay_start_time = None
+    node._pump_command_sent = False
     node._last_feedback_warn_time = 0.0
     node._last_serial_reopen_time = 0.0
     node.read_feedback = False
@@ -201,6 +205,8 @@ def test_reaching_grasp_target_enters_delay_then_place(monkeypatch):
 
     assert node._bridge_state == BridgeState.GRASP_DELAY
 
+    node._pump_command_sent = True
+    node._delay_start_time = 10.0
     node._send_delay_hold(
         now=11.2,
         target_type=TARGET_TYPE_GRASP,
@@ -209,6 +215,73 @@ def test_reaching_grasp_target_enters_delay_then_place(monkeypatch):
     )
 
     assert node._bridge_state == BridgeState.SEND_PLACE
+
+
+def test_grasp_delay_sends_pump_on_once(monkeypatch):
+    node = _make_node()
+    node._bridge_state = BridgeState.GRASP_DELAY
+    node._hold_target = (0.1, 0.2, 0.3)
+    frames = []
+    monkeypatch.setattr(node, '_write_frame', lambda frame: frames.append(frame) or True)
+
+    node.send_timer_callback()
+    node.send_timer_callback()
+
+    pump_frames = [frame for frame in frames if frame[2] == FUNC_PUMP_CONTROL]
+    assert len(pump_frames) == 1
+    assert pump_frames[0][3] == 1
+    assert pump_frames[0][4] == PUMP_ON
+
+
+def test_place_delay_retries_pump_off_until_success(monkeypatch):
+    node = _make_node()
+    node._bridge_state = BridgeState.PLACE_DELAY
+    node._hold_target = node._place_target
+    frames = []
+    attempts = {'count': 0}
+
+    def write_frame(frame):
+        if frame[2] == FUNC_PUMP_CONTROL:
+            attempts['count'] += 1
+            frames.append(frame)
+            return attempts['count'] >= 2
+        return True
+
+    monkeypatch.setattr(node, '_write_frame', write_frame)
+
+    node.send_timer_callback()
+    assert node._pump_command_sent is False
+    assert node._delay_start_time is None
+
+    node.send_timer_callback()
+    assert node._pump_command_sent is True
+    assert node._delay_start_time is not None
+
+    pump_frames = [frame for frame in frames if frame[2] == FUNC_PUMP_CONTROL]
+    assert len(pump_frames) == 2
+    assert pump_frames[-1][4] == PUMP_OFF
+
+
+def test_delay_timer_starts_after_pump_command_success(monkeypatch):
+    node = _make_node()
+    node._bridge_state = BridgeState.GRASP_DELAY
+    node._hold_target = (0.1, 0.2, 0.3)
+    node.arrival_delay_sec = 1.0
+    attempts = {'count': 0}
+
+    def write_frame(frame):
+        if frame[2] == FUNC_PUMP_CONTROL:
+            attempts['count'] += 1
+            return attempts['count'] >= 2
+        return True
+
+    monkeypatch.setattr(node, '_write_frame', write_frame)
+
+    node.send_timer_callback()
+    assert node._delay_start_time is None
+
+    node.send_timer_callback()
+    assert node._delay_start_time is not None
 
 
 def test_place_target_is_not_camera_transformed(monkeypatch):
@@ -251,6 +324,8 @@ def test_reaching_place_target_waits_and_resets_to_detection(monkeypatch):
 
     assert node._bridge_state == BridgeState.PLACE_DELAY
 
+    node._pump_command_sent = True
+    node._delay_start_time = 10.0
     node._send_delay_hold(
         now=11.2,
         target_type=TARGET_TYPE_PLACE,

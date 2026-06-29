@@ -6,10 +6,14 @@ from detection_3d.protocol import (
     ARM_STATE_MOVING,
     FUNC_ARM_FEEDBACK,
     FUNC_ARM_TARGET,
+    FUNC_PUMP_CONTROL,
+    PUMP_OFF,
+    PUMP_ON,
     TARGET_TYPE_GRASP,
     TARGET_TYPE_PLACE,
     build_frame,
     pack_arm_target,
+    pack_pump_control,
     parse_arm_feedback,
 )
 
@@ -59,6 +63,28 @@ def test_pack_arm_target_roundtrip():
 def test_pack_arm_target_rejects_unknown_type():
     with pytest.raises(ValueError, match='unsupported arm target type'):
         pack_arm_target(99, 1.0, 2.0, 3.0)
+
+
+def test_pack_pump_control_on_off_frames():
+    on_frame = pack_pump_control(True)
+    off_frame = pack_pump_control(False)
+
+    assert len(on_frame) == 6
+    assert on_frame[2] == FUNC_PUMP_CONTROL
+    assert on_frame[3] == 1
+    assert on_frame[4] == PUMP_ON
+    assert on_frame[-1] == (sum(on_frame[:-1]) & 0xFF)
+
+    assert len(off_frame) == 6
+    assert off_frame[2] == FUNC_PUMP_CONTROL
+    assert off_frame[3] == 1
+    assert off_frame[4] == PUMP_OFF
+    assert off_frame[-1] == (sum(off_frame[:-1]) & 0xFF)
+
+
+def test_pack_pump_control_rejects_unknown_state():
+    with pytest.raises(ValueError, match='unsupported pump state'):
+        pack_pump_control(2)
 
 
 def test_parse_arm_feedback_roundtrip():

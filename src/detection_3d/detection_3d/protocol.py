@@ -10,6 +10,7 @@ HEADER_1 = 0xAA
 
 # ---- Function IDs ----
 FUNC_ARM_TARGET = 0x12       # host -> MCU: target_type + arm-base xyz
+FUNC_PUMP_CONTROL = 0x13     # host -> MCU: pump on/off
 FUNC_ARM_FEEDBACK = 0x21     # MCU -> host: state + end xyz + theta1
 
 # Backward-compatible alias for older imports. New code should use
@@ -19,6 +20,10 @@ FUNC_ARM_TARGET_XYZ = FUNC_ARM_TARGET
 # ---- Target types ----
 TARGET_TYPE_GRASP = 0
 TARGET_TYPE_PLACE = 1
+
+# ---- Pump states ----
+PUMP_OFF = 0
+PUMP_ON = 1
 
 # ---- Arm states reported by MCU ----
 ARM_STATE_IDLE = 0
@@ -62,6 +67,17 @@ def pack_arm_target_xyz(x: float, y: float, z: float) -> bytes:
     Kept for older callers; the main path should use pack_arm_target().
     """
     return pack_arm_target(TARGET_TYPE_GRASP, x, y, z)
+
+
+def pack_pump_control(pump_on: int | bool) -> bytes:
+    """Pack an air pump switch command.
+
+    payload: u8 pump_on, 0 = off, 1 = on.
+    """
+    state = int(pump_on)
+    if state not in (PUMP_OFF, PUMP_ON):
+        raise ValueError(f'unsupported pump state: {pump_on}')
+    return build_frame(FUNC_PUMP_CONTROL, bytes([state]))
 
 
 def parse_arm_feedback(payload: bytes) -> ArmFeedback:

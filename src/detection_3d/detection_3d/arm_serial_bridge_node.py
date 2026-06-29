@@ -2,6 +2,7 @@
 ROS2 node: USB CDC serial bridge to STM32 MCU.
 
 Host -> MCU:  func 0x12, target_type + arm_base target xyz.
+Host -> MCU:  func 0x13, pump switch.
 MCU -> Host:  func 0x21, arm state + current end xyz + theta1.
 """
 
@@ -38,6 +39,7 @@ from detection_3d.protocol import (
     TARGET_TYPE_PLACE,
     ArmFeedback,
     pack_arm_target,
+    pack_pump_control,
     parse_arm_feedback,
 )
 from detection_3d.target_filter import EMAFilter, StabilityFilter, distance
@@ -270,6 +272,7 @@ class ArmSerialBridgeNode(Node):
         self._hold_target: tuple[float, float, float] | None = None
         self._reach_count = 0
         self._delay_start_time: float | None = None
+        self._pump_command_sent = False
         self._last_feedback_warn_time = 0.0
         self._last_serial_reopen_time = 0.0
 
@@ -467,6 +470,7 @@ class ArmSerialBridgeNode(Node):
         if self._bridge_state == BridgeState.SEND_GRASP:
             self._maybe_send_grasp(now)
         elif self._bridge_state == BridgeState.GRASP_DELAY:
+            self._send_pump_for_delay(TARGET_TYPE_GRASP)
             self._send_delay_hold(
                 now,
                 target_type=TARGET_TYPE_GRASP,
@@ -476,6 +480,7 @@ class ArmSerialBridgeNode(Node):
         elif self._bridge_state == BridgeState.SEND_PLACE:
             self._maybe_send_place(now)
         elif self._bridge_state == BridgeState.PLACE_DELAY:
+            self._send_pump_for_delay(TARGET_TYPE_PLACE)
             self._send_delay_hold(
                 now,
                 target_type=TARGET_TYPE_PLACE,
@@ -545,6 +550,8 @@ class ArmSerialBridgeNode(Node):
                 now=now,
             )
 
+        if not self._pump_command_sent:
+            return
         if self._delay_start_time is None:
             self._delay_start_time = now
         if now - self._delay_start_time < self.arrival_delay_sec:
@@ -557,6 +564,7 @@ class ArmSerialBridgeNode(Node):
         self._delay_start_time = None
         self._active_target = None
         self._hold_target = None
+        self._pump_command_sent = False
 
     # ------------------------------------------------------------------
     # Send helpers
@@ -619,10 +627,25 @@ class ArmSerialBridgeNode(Node):
             self._reach_count = 0
 
         if self._reach_count >= self.reach_stable_frames:
-            self._delay_start_time = now
+            self._delay_start_time = None
             self._hold_target = target
             self._reach_count = 0
+            self._pump_command_sent = False
             self._set_state(reached_state)
+
+    def _send_pump_for_delay(self, target_type: int):
+        if self._pump_command_sent:
+            return
+        pump_on = target_type == TARGET_TYPE_GRASP
+        if self._send_pump_command(pump_on):
+            self._pump_command_sent = True
+
+    def _send_pump_command(self, pump_on: bool) -> bool:
+        frame = pack_pump_control(pump_on)
+        if not self._write_frame(frame):
+            return False
+        self.get_logger().info(f'Sent pump state={1 if pump_on else 0}')
+        return True
 
     def _set_state(self, state: BridgeState):
         if self._bridge_state == state:
