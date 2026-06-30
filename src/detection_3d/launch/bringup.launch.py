@@ -76,6 +76,38 @@ def generate_launch_description():
         'source_image_height', default_value='480',
         description='Source RGB image height used for YOLO inference',
     )
+    depth_pixel_offset_x_arg = DeclareLaunchArgument(
+        'depth_pixel_offset_x_px', default_value='0.0',
+        description='Extra x offset from RGB detector pixel to depth pixel',
+    )
+    depth_pixel_offset_y_arg = DeclareLaunchArgument(
+        'depth_pixel_offset_y_px', default_value='0.0',
+        description='Extra y offset from RGB detector pixel to depth pixel',
+    )
+    debug_projection_log_arg = DeclareLaunchArgument(
+        'debug_projection_log', default_value='false',
+        description='Print per-detection projection details',
+    )
+    serial_tx_log_arg = DeclareLaunchArgument(
+        'serial_tx_log', default_value='true',
+        description='Print serial target/pump commands sent to MCU',
+    )
+    serial_tx_log_hex_arg = DeclareLaunchArgument(
+        'serial_tx_log_hex', default_value='false',
+        description='Print complete serial TX frame bytes in hex',
+    )
+    command_offset_x_arg = DeclareLaunchArgument(
+        'command_offset_x_m', default_value='0.0',
+        description='Final x command offset applied before serial TX',
+    )
+    command_offset_y_arg = DeclareLaunchArgument(
+        'command_offset_y_m', default_value='0.0',
+        description='Final y command offset applied before serial TX',
+    )
+    command_offset_z_arg = DeclareLaunchArgument(
+        'command_offset_z_m', default_value='0.09',
+        description='Final z command offset applied before serial TX',
+    )
 
     # ---- Detection nodes ----
     yolo_node = Node(
@@ -98,6 +130,9 @@ def generate_launch_description():
             'source_image_width': LaunchConfiguration('source_image_width'),
             'source_image_height': LaunchConfiguration('source_image_height'),
             'depth_estimator_mode': LaunchConfiguration('depth_estimator_mode'),
+            'depth_pixel_offset_x_px': LaunchConfiguration('depth_pixel_offset_x_px'),
+            'depth_pixel_offset_y_px': LaunchConfiguration('depth_pixel_offset_y_px'),
+            'debug_projection_log': LaunchConfiguration('debug_projection_log'),
         }],
         output='screen',
     )
@@ -110,6 +145,11 @@ def generate_launch_description():
         parameters=[params_file, {
             'serial_port': LaunchConfiguration('serial_port'),
             'target_class': LaunchConfiguration('target_class'),
+            'serial_tx_log': LaunchConfiguration('serial_tx_log'),
+            'serial_tx_log_hex': LaunchConfiguration('serial_tx_log_hex'),
+            'command_offset_x_m': LaunchConfiguration('command_offset_x_m'),
+            'command_offset_y_m': LaunchConfiguration('command_offset_y_m'),
+            'command_offset_z_m': LaunchConfiguration('command_offset_z_m'),
         }],
         output='screen',
         condition=IfCondition(LaunchConfiguration('use_arm_bridge')),
@@ -140,6 +180,8 @@ def generate_launch_description():
             'camera_info_topic': LaunchConfiguration('camera_info_topic'),
             'source_image_width': LaunchConfiguration('source_image_width'),
             'source_image_height': LaunchConfiguration('source_image_height'),
+            'depth_pixel_offset_x_px': LaunchConfiguration('depth_pixel_offset_x_px'),
+            'depth_pixel_offset_y_px': LaunchConfiguration('depth_pixel_offset_y_px'),
         }],
         output='screen',
         condition=IfCondition(LaunchConfiguration('use_estimator_comparison_logger')),
@@ -172,6 +214,14 @@ def generate_launch_description():
         target_class_arg,
         source_w_arg,
         source_h_arg,
+        depth_pixel_offset_x_arg,
+        depth_pixel_offset_y_arg,
+        debug_projection_log_arg,
+        serial_tx_log_arg,
+        serial_tx_log_hex_arg,
+        command_offset_x_arg,
+        command_offset_y_arg,
+        command_offset_z_arg,
         yolo_node,
         calc_node,
         arm_bridge_node,

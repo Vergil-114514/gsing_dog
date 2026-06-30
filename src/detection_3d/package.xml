@@ -16,6 +16,10 @@
   <depend>message_filters</depend>
   <depend>tf2_ros</depend>
   <depend>std_msgs</depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+  <depend>launch_xml</depend>
+  <depend>astra_camera</depend>
   <depend>quadruped_interfaces</depend>
   <depend>python3-numpy</depend>
   <depend>python3-opencv</depend>

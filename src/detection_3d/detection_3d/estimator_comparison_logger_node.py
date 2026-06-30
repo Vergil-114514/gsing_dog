@@ -16,7 +16,7 @@ from detection_3d.depth_processor import (
     extract_roi,
     filter_depth_roi,
 )
-from detection_3d.geometry import project_pixel_to_xyz
+from detection_3d.geometry import map_source_pixel_to_depth_pixel, project_pixel_to_xyz
 
 
 class EstimatorComparisonLoggerNode(Node):
@@ -41,6 +41,8 @@ class EstimatorComparisonLoggerNode(Node):
         self.declare_parameter('camera_info_topic', '/camera/depth/camera_info')
         self.declare_parameter('source_image_width', 640)
         self.declare_parameter('source_image_height', 480)
+        self.declare_parameter('depth_pixel_offset_x_px', 0.0)
+        self.declare_parameter('depth_pixel_offset_y_px', 0.0)
         self.declare_parameter('max_depth_m', 10.0)
         self.declare_parameter('min_depth_valid_ratio', 0.3)
         self.declare_parameter('depth_roi_ratio', 0.3)
@@ -59,6 +61,12 @@ class EstimatorComparisonLoggerNode(Node):
         camera_info_topic = self.get_parameter('camera_info_topic').value
         self.source_w = int(self.get_parameter('source_image_width').value)
         self.source_h = int(self.get_parameter('source_image_height').value)
+        self.depth_pixel_offset_x_px = float(
+            self.get_parameter('depth_pixel_offset_x_px').value
+        )
+        self.depth_pixel_offset_y_px = float(
+            self.get_parameter('depth_pixel_offset_y_px').value
+        )
         self.max_depth_m = float(self.get_parameter('max_depth_m').value)
         self.min_depth_valid_ratio = float(self.get_parameter('min_depth_valid_ratio').value)
         self.depth_roi_ratio = float(self.get_parameter('depth_roi_ratio').value)
@@ -173,11 +181,18 @@ class EstimatorComparisonLoggerNode(Node):
             box_h = det2d.bbox.size_y * scale_y
             roi_size = compute_roi_size(box_w, box_h, self.depth_roi_ratio, self.min_roi)
 
-            u = int(det2d.bbox.center.position.x * scale_x)
-            v = int(det2d.bbox.center.position.y * scale_y)
             half = roi_size // 2
-            u = max(half, min(u, depth_w - 1 - half))
-            v = max(half, min(v, depth_h - 1 - half))
+            u, v = map_source_pixel_to_depth_pixel(
+                det2d.bbox.center.position.x,
+                det2d.bbox.center.position.y,
+                self.source_w,
+                self.source_h,
+                depth_w,
+                depth_h,
+                self.depth_pixel_offset_x_px,
+                self.depth_pixel_offset_y_px,
+                clamp_half_size=half,
+            )
 
             roi = extract_roi(depth_image, u, v, roi_size)
             if roi is None:

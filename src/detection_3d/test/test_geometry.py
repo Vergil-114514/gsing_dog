@@ -1,5 +1,5 @@
 import pytest
-from detection_3d.geometry import project_pixel_to_xyz
+from detection_3d.geometry import map_source_pixel_to_depth_pixel, project_pixel_to_xyz
 
 
 def test_project_pixel_to_xyz_center():
@@ -22,3 +22,45 @@ def test_project_pixel_to_xyz_zero_depth():
     assert x == pytest.approx(0.0)
     assert y == pytest.approx(0.0)
     assert z == pytest.approx(0.0)
+
+
+def test_map_source_pixel_to_depth_pixel_scales_and_offsets():
+    u, v = map_source_pixel_to_depth_pixel(
+        source_x=320.0,
+        source_y=240.0,
+        source_width=640,
+        source_height=480,
+        depth_width=640,
+        depth_height=400,
+        offset_x_px=2.0,
+        offset_y_px=-3.0,
+        clamp_half_size=2,
+    )
+
+    assert (u, v) == (322, 197)
+
+
+def test_map_source_pixel_to_depth_pixel_clamps_to_roi_margin():
+    u, v = map_source_pixel_to_depth_pixel(
+        source_x=-100.0,
+        source_y=999.0,
+        source_width=640,
+        source_height=480,
+        depth_width=640,
+        depth_height=400,
+        clamp_half_size=5,
+    )
+
+    assert (u, v) == (5, 394)
+
+
+def test_map_source_pixel_to_depth_pixel_rejects_invalid_dimensions():
+    with pytest.raises(ValueError):
+        map_source_pixel_to_depth_pixel(
+            source_x=0.0,
+            source_y=0.0,
+            source_width=0,
+            source_height=480,
+            depth_width=640,
+            depth_height=400,
+        )

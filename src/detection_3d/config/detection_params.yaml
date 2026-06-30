@@ -30,6 +30,9 @@ detection_3d_calculator:
     # Resolution of the source RGB image used for YOLO inference
     source_image_width: 640
     source_image_height: 480
+    depth_pixel_offset_x_px: 0.0
+    depth_pixel_offset_y_px: 0.0
+    debug_projection_log: false
     max_depth_m: 10.0
 
     # ---- depth quality ----
@@ -61,6 +64,8 @@ estimator_comparison_logger:
     camera_info_topic: "/camera/depth/camera_info"
     source_image_width: 640
     source_image_height: 480
+    depth_pixel_offset_x_px: 0.0
+    depth_pixel_offset_y_px: 0.0
     max_depth_m: 10.0
     min_depth_valid_ratio: 0.3
     depth_roi_ratio: 0.3
@@ -87,10 +92,16 @@ arm_serial_bridge:
     reach_stable_frames: 3
     arrival_delay_sec: 1.0
     feedback_timeout_sec: 0.5
+    detection_timeout_sec: 0.5
     camera_to_arm_transform_enabled: true
     camera_offset_x_m: 0.105
     camera_offset_y_m: 0.0
     camera_offset_z_m: -0.078
+    command_offset_x_m: 0.0
+    command_offset_y_m: 0.0
+    command_offset_z_m: 0.09
+    serial_tx_log: true
+    serial_tx_log_hex: false
 
     # Place target in arm_base frame, meters (÷1000 from MCU mm coords)
     # Flat array: [x1, y1, z1,  x2, y2, z2, ...]

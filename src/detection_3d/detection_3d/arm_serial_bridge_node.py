@@ -48,7 +48,6 @@ from detection_3d.vision_transform import (
     transform_camera_to_arm_base,
 )
 
-
 class BridgeState(Enum):
     """Host-side grasp/place state machine states."""
 
@@ -196,12 +195,18 @@ class ArmSerialBridgeNode(Node):
         self.declare_parameter('reach_stable_frames', 3)
         self.declare_parameter('arrival_delay_sec', 1.0)
         self.declare_parameter('feedback_timeout_sec', 0.5)
+        self.declare_parameter('detection_timeout_sec', 0.5)
 
         # ---- vision camera -> arm base transform ----
         self.declare_parameter('camera_to_arm_transform_enabled', True)
         self.declare_parameter('camera_offset_x_m', 0.105)
         self.declare_parameter('camera_offset_y_m', 0.0)
         self.declare_parameter('camera_offset_z_m', -0.078)
+        self.declare_parameter('command_offset_x_m', 0.0)
+        self.declare_parameter('command_offset_y_m', 0.0)
+        self.declare_parameter('command_offset_z_m', 0.09)
+        self.declare_parameter('serial_tx_log', True)
+        self.declare_parameter('serial_tx_log_hex', False)
 
         # ---- place targets ----
         self.declare_parameter('place_targets_m', [0.0, 0.0, 0.0])
@@ -231,6 +236,9 @@ class ArmSerialBridgeNode(Node):
         self.feedback_timeout_sec = float(
             self.get_parameter('feedback_timeout_sec').value
         )
+        self.detection_timeout_sec = float(
+            self.get_parameter('detection_timeout_sec').value
+        )
         self.camera_to_arm_transform_enabled = bool(
             self.get_parameter('camera_to_arm_transform_enabled').value
         )
@@ -245,6 +253,13 @@ class ArmSerialBridgeNode(Node):
             camera_offset_y_m=float(self.get_parameter('camera_offset_y_m').value),
             camera_offset_z_m=float(self.get_parameter('camera_offset_z_m').value),
         )
+        self.command_offset_m = (
+            float(self.get_parameter('command_offset_x_m').value),
+            float(self.get_parameter('command_offset_y_m').value),
+            float(self.get_parameter('command_offset_z_m').value),
+        )
+        self.serial_tx_log = bool(self.get_parameter('serial_tx_log').value)
+        self.serial_tx_log_hex = bool(self.get_parameter('serial_tx_log_hex').value)
 
         place_targets_m_raw = self.get_parameter('place_targets_m').value
         place_target_index = int(self.get_parameter('place_target_index').value)
@@ -262,10 +277,12 @@ class ArmSerialBridgeNode(Node):
         # === place targets ===
         place_targets = validate_place_targets(place_targets_m_raw)
         self._place_target = get_place_target(place_targets, place_target_index)
+        self._place_target_command = self._apply_command_offset(self._place_target)
 
         # === host-driven state ===
         self._bridge_state = BridgeState.WAIT_DETECTION
         self._latest_stable_camera_target: tuple[float, float, float] | None = None
+        self._last_detection_time: float | None = None
         self._latest_feedback: ArmFeedback | None = None
         self._last_feedback_time: float | None = None
         self._active_target: tuple[float, float, float] | None = None
@@ -273,6 +290,7 @@ class ArmSerialBridgeNode(Node):
         self._reach_count = 0
         self._delay_start_time: float | None = None
         self._pump_command_sent = False
+        self._last_detection_warn_time = 0.0
         self._last_feedback_warn_time = 0.0
         self._last_serial_reopen_time = 0.0
 
@@ -299,8 +317,12 @@ class ArmSerialBridgeNode(Node):
             f'ema_alpha={ema_alpha:.2f}, stable={stable_frames} frames, '
             f'target_class="{self.target_class or "any"}", '
             f'reach_tolerance={self.reach_tolerance_m:.3f}m, '
+            f'detection_timeout={self.detection_timeout_sec:.2f}s, '
             f'feedback_timeout={self.feedback_timeout_sec:.2f}s, '
             f'transform_enabled={self.camera_to_arm_transform_enabled}, '
+            f'command_offset=({self.command_offset_m[0]:.3f}, '
+            f'{self.command_offset_m[1]:.3f}, '
+            f'{self.command_offset_m[2]:.3f})m, '
             f'place=({self._place_target[0]:.3f}, '
             f'{self._place_target[1]:.3f}, '
             f'{self._place_target[2]:.3f})m'
@@ -423,6 +445,7 @@ class ArmSerialBridgeNode(Node):
         ):
             return
         if not msg.detections:
+            self._drop_grasp_detection('empty detection message')
             return
 
         best = None
@@ -439,6 +462,7 @@ class ArmSerialBridgeNode(Node):
                 best = det
 
         if best is None:
+            self._drop_grasp_detection('no matching detection')
             return
 
         pos = best.results[0].pose.pose.position
@@ -448,6 +472,7 @@ class ArmSerialBridgeNode(Node):
         stable = self.stability.update(filtered)
         if stable is not None:
             self._latest_stable_camera_target = stable
+            self._last_detection_time = time.monotonic()
             if self._bridge_state == BridgeState.WAIT_DETECTION:
                 self._active_target = None
                 self._hold_target = None
@@ -491,6 +516,10 @@ class ArmSerialBridgeNode(Node):
     def _maybe_send_grasp(self, now: float):
         if self._latest_stable_camera_target is None:
             return
+        if not self._has_fresh_detection(now):
+            self._warn_detection_timeout(now)
+            self._drop_grasp_detection('vision target timeout')
+            return
         if not self._has_fresh_feedback(now):
             self._warn_feedback_timeout(now)
             return
@@ -503,6 +532,7 @@ class ArmSerialBridgeNode(Node):
             theta1_rad=self._latest_feedback.theta1_rad,
             current_end_xyz_m=self._latest_feedback.end_xyz_m,
         )
+        target = self._apply_command_offset(target)
 
         if self._send_target_immediate(
             target, target_type=TARGET_TYPE_GRASP, tag='grasp', now=now
@@ -516,7 +546,7 @@ class ArmSerialBridgeNode(Node):
             )
 
     def _maybe_send_place(self, now: float):
-        target = self._place_target
+        target = self._place_target_command
         if self._send_target_immediate(
             target, target_type=TARGET_TYPE_PLACE, tag='place', now=now
         ):
@@ -538,7 +568,7 @@ class ArmSerialBridgeNode(Node):
         target = self._hold_target
         if target is None:
             target = (
-                self._place_target
+                self._place_target_command
                 if target_type == TARGET_TYPE_PLACE
                 else self._active_target
             )
@@ -591,11 +621,23 @@ class ArmSerialBridgeNode(Node):
 
         self.last_sent_target = target
         self.last_send_time = now
-        self.get_logger().info(
-            f'Sent {tag} type={target_type} '
-            f'({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})m'
-        )
+        self._log_target_tx(frame, target, target_type, tag)
         return True
+
+    def _has_fresh_detection(self, now: float) -> bool:
+        if self._latest_stable_camera_target is None:
+            return False
+        if self._last_detection_time is None:
+            return False
+        return now - self._last_detection_time <= self.detection_timeout_sec
+
+    def _warn_detection_timeout(self, now: float):
+        if now - self._last_detection_warn_time < 1.0:
+            return
+        self._last_detection_warn_time = now
+        self.get_logger().warn(
+            'No fresh vision target; grasp target is not sent'
+        )
 
     def _has_fresh_feedback(self, now: float) -> bool:
         if self._latest_feedback is None or self._last_feedback_time is None:
@@ -608,6 +650,16 @@ class ArmSerialBridgeNode(Node):
         self._last_feedback_warn_time = now
         self.get_logger().warn(
             'No fresh MCU feedback; grasp target is not sent'
+        )
+
+    def _apply_command_offset(
+        self, target: tuple[float, float, float]
+    ) -> tuple[float, float, float]:
+        """Apply final mechanical command compensation before sending to MCU."""
+        return (
+            target[0] + self.command_offset_m[0],
+            target[1] + self.command_offset_m[1],
+            target[2] + self.command_offset_m[2],
         )
 
     def _update_arrival(
@@ -644,8 +696,35 @@ class ArmSerialBridgeNode(Node):
         frame = pack_pump_control(pump_on)
         if not self._write_frame(frame):
             return False
-        self.get_logger().info(f'Sent pump state={1 if pump_on else 0}')
+        self._log_pump_tx(frame, pump_on)
         return True
+
+    def _log_target_tx(
+        self,
+        frame: bytes,
+        target: tuple[float, float, float],
+        target_type: int,
+        tag: str,
+    ) -> None:
+        """Print the exact target command values written to the CDC serial port."""
+        if not self.serial_tx_log:
+            return
+        msg = (
+            f'SERIAL_TX 0x12 ARM_TARGET target={tag} type={target_type} '
+            f'x={target[0]:.6f} y={target[1]:.6f} z={target[2]:.6f}'
+        )
+        if self.serial_tx_log_hex:
+            msg = f'{msg} frame={frame.hex(" ")}'
+        self.get_logger().info(msg)
+
+    def _log_pump_tx(self, frame: bytes, pump_on: bool) -> None:
+        """Print the exact pump command state written to the CDC serial port."""
+        if not self.serial_tx_log:
+            return
+        msg = f'SERIAL_TX 0x13 PUMP state={1 if pump_on else 0}'
+        if self.serial_tx_log_hex:
+            msg = f'{msg} frame={frame.hex(" ")}'
+        self.get_logger().info(msg)
 
     def _set_state(self, state: BridgeState):
         if self._bridge_state == state:
@@ -654,10 +733,21 @@ class ArmSerialBridgeNode(Node):
         self._bridge_state = state
         self.get_logger().info(f'Arm bridge state: {prev.value} -> {state.value}')
 
+    def _drop_grasp_detection(self, reason: str):
+        if self._bridge_state != BridgeState.SEND_GRASP:
+            return
+        self.get_logger().warn(f'Vision target lost during grasp: {reason}')
+        self._reset_detection_state()
+        self._active_target = None
+        self._hold_target = None
+        self._reach_count = 0
+        self._set_state(BridgeState.WAIT_DETECTION)
+
     def _reset_detection_state(self):
         self.ema.reset()
         self.stability.reset()
         self._latest_stable_camera_target = None
+        self._last_detection_time = None
 
     # ------------------------------------------------------------------
 

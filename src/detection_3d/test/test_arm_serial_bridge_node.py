@@ -15,17 +15,20 @@ from detection_3d.vision_transform import VisionTransformConfig
 
 
 class _Logger:
+    def __init__(self):
+        self.messages = []
+
     def info(self, *_args, **_kwargs):
-        pass
+        self.messages.append(('info', _args[0] if _args else ''))
 
     def warn(self, *_args, **_kwargs):
-        pass
+        self.messages.append(('warn', _args[0] if _args else ''))
 
     def error(self, *_args, **_kwargs):
-        pass
+        self.messages.append(('error', _args[0] if _args else ''))
 
     def debug(self, *_args, **_kwargs):
-        pass
+        self.messages.append(('debug', _args[0] if _args else ''))
 
 
 class _IdentityFilter:
@@ -74,6 +77,7 @@ def _make_node() -> ArmSerialBridgeNode:
     node = ArmSerialBridgeNode.__new__(ArmSerialBridgeNode)
     node._bridge_state = BridgeState.WAIT_DETECTION
     node._latest_stable_camera_target = None
+    node._last_detection_time = None
     node._latest_feedback = None
     node._last_feedback_time = None
     node._active_target = None
@@ -91,6 +95,7 @@ def _make_node() -> ArmSerialBridgeNode:
     node.reach_stable_frames = 3
     node.arrival_delay_sec = 1.0
     node.feedback_timeout_sec = 0.5
+    node.detection_timeout_sec = 0.5
     node.target_class = ''
     node.camera_to_arm_transform_enabled = True
     node.vision_transform = VisionTransformConfig(
@@ -98,12 +103,18 @@ def _make_node() -> ArmSerialBridgeNode:
         camera_offset_y_m=0.0,
         camera_offset_z_m=-0.078,
     )
+    node.command_offset_m = (0.0, 0.0, 0.09)
+    node.serial_tx_log = True
+    node.serial_tx_log_hex = False
     node._place_target = (-0.1, 0.111, 0.42)
+    node._place_target_command = (-0.1, 0.111, 0.51)
     node.ema = _IdentityFilter()
     node.stability = _IdentityFilter()
     node._sent = []
+    node._last_detection_warn_time = 0.0
     node._write_frame = lambda frame: True
-    node.get_logger = lambda: _Logger()
+    node._logger = _Logger()
+    node.get_logger = lambda: node._logger
     return node
 
 
@@ -130,13 +141,36 @@ def test_detection_callback_caches_camera_frame_target_only():
     node.detection_callback(_DetectionArray([_Detection((0.01, 0.02, 0.15))]))
 
     assert node._latest_stable_camera_target == pytest.approx((0.01, 0.02, 0.15))
+    assert node._last_detection_time is not None
     assert node._bridge_state == BridgeState.SEND_GRASP
+
+
+def test_grasp_target_not_sent_without_detection(monkeypatch):
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.2, -0.1, 0.3),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+    sent = []
+    monkeypatch.setattr(
+        node,
+        '_send_target_immediate',
+        lambda *args, **kwargs: sent.append((args, kwargs)) or True,
+    )
+
+    node._maybe_send_grasp(now=10.1)
+
+    assert sent == []
 
 
 def test_grasp_send_uses_latest_feedback_transform(monkeypatch):
     node = _make_node()
     node._bridge_state = BridgeState.SEND_GRASP
     node._latest_stable_camera_target = (0.01, 0.02, 0.15)
+    node._last_detection_time = 10.0
     node._latest_feedback = ArmFeedback(
         arm_state=ARM_STATE_MOVING,
         end_xyz_m=(0.2, -0.1, 0.3),
@@ -155,15 +189,54 @@ def test_grasp_send_uses_latest_feedback_transform(monkeypatch):
     node._maybe_send_grasp(now=10.1)
 
     assert len(sent) == 1
-    assert sent[0][0] == pytest.approx((0.325, -0.09, 0.072))
+    assert sent[0][0] == pytest.approx((0.325, -0.09, 0.162))
     assert sent[0][1] == TARGET_TYPE_GRASP
     assert sent[0][2] == 'grasp'
+
+
+def test_grasp_target_timeout_clears_target_and_waits(monkeypatch):
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_stable_camera_target = (0.01, 0.02, 0.15)
+    node._last_detection_time = 9.0
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.2, -0.1, 0.3),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+    sent = []
+    monkeypatch.setattr(
+        node,
+        '_send_target_immediate',
+        lambda *args, **kwargs: sent.append((args, kwargs)) or True,
+    )
+
+    node._maybe_send_grasp(now=10.0)
+
+    assert sent == []
+    assert node._bridge_state == BridgeState.WAIT_DETECTION
+    assert node._latest_stable_camera_target is None
+    assert node._last_detection_time is None
+
+
+def test_empty_detection_message_stops_grasp_send():
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_stable_camera_target = (0.01, 0.02, 0.15)
+    node._last_detection_time = 10.0
+
+    node.detection_callback(_DetectionArray([]))
+
+    assert node._bridge_state == BridgeState.WAIT_DETECTION
+    assert node._latest_stable_camera_target is None
 
 
 def test_grasp_target_not_sent_when_feedback_is_stale(monkeypatch):
     node = _make_node()
     node._bridge_state = BridgeState.SEND_GRASP
     node._latest_stable_camera_target = (0.01, 0.02, 0.15)
+    node._last_detection_time = 10.0
     node._latest_feedback = ArmFeedback(
         arm_state=ARM_STATE_MOVING,
         end_xyz_m=(0.2, -0.1, 0.3),
@@ -194,14 +267,42 @@ def test_reaching_grasp_target_enters_delay_then_place(monkeypatch):
     node._latest_stable_camera_target = (0.0, 0.0, 0.0)
     node._latest_feedback = ArmFeedback(
         arm_state=ARM_STATE_MOVING,
-        end_xyz_m=(0.325, -0.09, 0.072),
+        end_xyz_m=(0.2, -0.1, 0.3),
         theta1_rad=0.0,
     )
     node._last_feedback_time = 10.0
-    monkeypatch.setattr(node, '_send_target_immediate', lambda *args, **kwargs: True)
+    node._last_detection_time = 10.0
+    sent = []
+    monkeypatch.setattr(
+        node,
+        '_send_target_immediate',
+        lambda target, target_type, tag, now=None: sent.append(
+            (target, target_type, tag)
+        ) or True,
+    )
 
     node._maybe_send_grasp(now=10.0)
-    node._maybe_send_grasp(now=10.1)
+
+    assert len(sent) == 1
+    assert sent[0][0] == pytest.approx((0.2, -0.1, 0.39))
+    assert sent[0][1:] == (TARGET_TYPE_GRASP, 'grasp')
+
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=sent[0][0],
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.1
+    node._update_arrival(
+        now=10.1,
+        target=sent[0][0],
+        reached_state=BridgeState.GRASP_DELAY,
+    )
+    node._update_arrival(
+        now=10.2,
+        target=sent[0][0],
+        reached_state=BridgeState.GRASP_DELAY,
+    )
 
     assert node._bridge_state == BridgeState.GRASP_DELAY
 
@@ -304,7 +405,7 @@ def test_place_target_is_not_camera_transformed(monkeypatch):
 
     node._maybe_send_place(now=10.1)
 
-    assert sent == [(node._place_target, TARGET_TYPE_PLACE, 'place')]
+    assert sent == [(node._place_target_command, TARGET_TYPE_PLACE, 'place')]
 
 
 def test_reaching_place_target_waits_and_resets_to_detection(monkeypatch):
@@ -312,9 +413,10 @@ def test_reaching_place_target_waits_and_resets_to_detection(monkeypatch):
     node.reach_stable_frames = 1
     node._bridge_state = BridgeState.SEND_PLACE
     node._latest_stable_camera_target = (0.01, 0.02, 0.15)
+    node._last_detection_time = 9.0
     node._latest_feedback = ArmFeedback(
         arm_state=ARM_STATE_MOVING,
-        end_xyz_m=node._place_target,
+        end_xyz_m=node._place_target_command,
         theta1_rad=0.0,
     )
     node._last_feedback_time = 10.0
@@ -335,8 +437,71 @@ def test_reaching_place_target_waits_and_resets_to_detection(monkeypatch):
 
     assert node._bridge_state == BridgeState.WAIT_DETECTION
     assert node._latest_stable_camera_target is None
+    assert node._last_detection_time is None
     assert node.ema.reset_count == 1
     assert node.stability.reset_count == 1
+
+
+def test_place_send_ignores_stale_detection(monkeypatch):
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_PLACE
+    node._latest_stable_camera_target = (0.01, 0.02, 0.15)
+    node._last_detection_time = 1.0
+    sent = []
+    monkeypatch.setattr(
+        node,
+        '_send_target_immediate',
+        lambda target, target_type, tag, now=None: sent.append(
+            (target, target_type, tag)
+        ) or True,
+    )
+
+    node._maybe_send_place(now=10.0)
+
+    assert sent == [(node._place_target_command, TARGET_TYPE_PLACE, 'place')]
+
+
+def test_command_offset_applies_all_axes():
+    node = _make_node()
+    node.command_offset_m = (0.01, -0.02, 0.09)
+
+    assert node._apply_command_offset((0.1, 0.2, 0.3)) == pytest.approx(
+        (0.11, 0.18, 0.39)
+    )
+
+
+def test_serial_target_log_contains_final_command_values():
+    node = _make_node()
+    node.serial_tx_log = True
+    node.serial_tx_log_hex = True
+    frame = bytes([0x55, 0xAA, 0x12, 0x0D, 0x00, 0x24])
+
+    node._log_target_tx(
+        frame,
+        target=(0.1, -0.2, 0.39),
+        target_type=TARGET_TYPE_GRASP,
+        tag='grasp',
+    )
+
+    assert node._logger.messages[-1] == (
+        'info',
+        'SERIAL_TX 0x12 ARM_TARGET target=grasp type=0 '
+        'x=0.100000 y=-0.200000 z=0.390000 '
+        'frame=55 aa 12 0d 00 24',
+    )
+
+
+def test_serial_pump_log_contains_state():
+    node = _make_node()
+    node.serial_tx_log = True
+    node.serial_tx_log_hex = False
+
+    node._log_pump_tx(bytes([0x55, 0xAA, 0x13, 0x01, 0x01, 0x14]), pump_on=True)
+
+    assert node._logger.messages[-1] == (
+        'info',
+        'SERIAL_TX 0x13 PUMP state=1',
+    )
 
 
 def test_mcu_error_state_stops_sending(monkeypatch):

@@ -24,7 +24,10 @@ from cv_bridge import CvBridge
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from tf2_ros import TransformBroadcaster
 
-from detection_3d.geometry import project_pixel_to_xyz
+from detection_3d.geometry import (
+    map_source_pixel_to_depth_pixel,
+    project_pixel_to_xyz,
+)
 from detection_3d.depth_processor import (
     compute_roi_size,
     extract_roi,
@@ -58,6 +61,9 @@ class Detection3DCalculatorNode(Node):
         self.declare_parameter('publish_markers_topic', '/detection/markers')
         self.declare_parameter('source_image_width', 640)
         self.declare_parameter('source_image_height', 480)
+        self.declare_parameter('depth_pixel_offset_x_px', 0.0)
+        self.declare_parameter('depth_pixel_offset_y_px', 0.0)
+        self.declare_parameter('debug_projection_log', False)
         self.declare_parameter('max_depth_m', 10.0)
 
         # ---- new: depth quality ----
@@ -86,6 +92,15 @@ class Detection3DCalculatorNode(Node):
         markers_topic = self.get_parameter('publish_markers_topic').value
         self.source_w = int(self.get_parameter('source_image_width').value)
         self.source_h = int(self.get_parameter('source_image_height').value)
+        self.depth_pixel_offset_x_px = float(
+            self.get_parameter('depth_pixel_offset_x_px').value
+        )
+        self.depth_pixel_offset_y_px = float(
+            self.get_parameter('depth_pixel_offset_y_px').value
+        )
+        self.debug_projection_log = bool(
+            self.get_parameter('debug_projection_log').value
+        )
         self.max_depth_m = float(self.get_parameter('max_depth_m').value)
 
         self.min_depth_valid_ratio = float(self.get_parameter('min_depth_valid_ratio').value)
@@ -160,7 +175,9 @@ class Detection3DCalculatorNode(Node):
             f'min_cluster_ratio={self.depth_min_cluster_ratio}, '
             f'valid_ratio>={self.min_depth_valid_ratio}, '
             f'stable_window={stable_window_size}, jump_thresh={self.jump_threshold_m}m, '
-            f'source_res={self.source_w}x{self.source_h}'
+            f'source_res={self.source_w}x{self.source_h}, '
+            f'depth_pixel_offset=({self.depth_pixel_offset_x_px:.2f}, '
+            f'{self.depth_pixel_offset_y_px:.2f})px'
         )
 
     # ------------------------------------------------------------------
@@ -211,12 +228,20 @@ class Detection3DCalculatorNode(Node):
             box_h = det2d.bbox.size_y * scale_y
             roi_size = compute_roi_size(box_w, box_h, self.depth_roi_ratio, self.min_roi)
 
-            # Center in depth image coordinates
-            u = int(det2d.bbox.center.position.x * scale_x)
-            v = int(det2d.bbox.center.position.y * scale_y)
+            # Center in depth image coordinates. The extra offset is a field
+            # calibration knob for residual RGB/depth alignment error.
             half = roi_size // 2
-            u = max(half, min(u, depth_w - 1 - half))
-            v = max(half, min(v, depth_h - 1 - half))
+            u, v = map_source_pixel_to_depth_pixel(
+                det2d.bbox.center.position.x,
+                det2d.bbox.center.position.y,
+                self.source_w,
+                self.source_h,
+                depth_w,
+                depth_h,
+                self.depth_pixel_offset_x_px,
+                self.depth_pixel_offset_y_px,
+                clamp_half_size=half,
+            )
 
             # Extract and filter depth ROI
             roi = extract_roi(depth_image, u, v, roi_size)
@@ -260,6 +285,15 @@ class Detection3DCalculatorNode(Node):
             x, y, z = project_pixel_to_xyz(
                 target_u, target_v, depth_m, self.fx, self.fy, self.cx, self.cy
             )
+            if self.debug_projection_log:
+                self.get_logger().info(
+                    f'PROJECTION cls={cls_name} '
+                    f'src=({det2d.bbox.center.position.x:.1f}, '
+                    f'{det2d.bbox.center.position.y:.1f}) '
+                    f'depth_center=({u}, {v}) '
+                    f'target=({target_u:.1f}, {target_v:.1f}) '
+                    f'depth={depth_m:.3f}m xyz=({x:.3f}, {y:.3f}, {z:.3f})m'
+                )
 
             composite = compute_composite_score(score, quality)
 
