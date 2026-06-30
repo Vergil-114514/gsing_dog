@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - unit tests without ROS2 messages
 from detection_3d.place_targets import validate_place_targets, get_place_target
 from detection_3d.protocol import (
     ARM_STATE_ERROR,
+    ARM_STATE_REACHED,
     FUNC_ARM_FEEDBACK,
     TARGET_TYPE_GRASP,
     TARGET_TYPE_PLACE,
@@ -196,15 +197,22 @@ class ArmSerialBridgeNode(Node):
         self.declare_parameter('arrival_delay_sec', 1.0)
         self.declare_parameter('feedback_timeout_sec', 0.5)
         self.declare_parameter('detection_timeout_sec', 0.5)
+        self.declare_parameter('arrival_accept_mcu_reached', True)
+        self.declare_parameter('arrival_stall_enabled', True)
+        self.declare_parameter('arrival_stall_epsilon_m', 0.003)
+        self.declare_parameter('arrival_stall_frames', 5)
+        self.declare_parameter('arrival_stall_max_distance_m', 0.08)
 
         # ---- vision camera -> arm base transform ----
         self.declare_parameter('camera_to_arm_transform_enabled', True)
         self.declare_parameter('camera_offset_x_m', 0.105)
         self.declare_parameter('camera_offset_y_m', 0.0)
         self.declare_parameter('camera_offset_z_m', -0.078)
+        self.declare_parameter('camera_tilt_forward_deg', 45.0)
         self.declare_parameter('command_offset_x_m', 0.0)
         self.declare_parameter('command_offset_y_m', 0.0)
         self.declare_parameter('command_offset_z_m', 0.09)
+        self.declare_parameter('command_abs_y_offset_m', 0.0)
         self.declare_parameter('serial_tx_log', True)
         self.declare_parameter('serial_tx_log_hex', False)
 
@@ -239,6 +247,21 @@ class ArmSerialBridgeNode(Node):
         self.detection_timeout_sec = float(
             self.get_parameter('detection_timeout_sec').value
         )
+        self.arrival_accept_mcu_reached = bool(
+            self.get_parameter('arrival_accept_mcu_reached').value
+        )
+        self.arrival_stall_enabled = bool(
+            self.get_parameter('arrival_stall_enabled').value
+        )
+        self.arrival_stall_epsilon_m = float(
+            self.get_parameter('arrival_stall_epsilon_m').value
+        )
+        self.arrival_stall_frames = max(
+            1, int(self.get_parameter('arrival_stall_frames').value)
+        )
+        self.arrival_stall_max_distance_m = float(
+            self.get_parameter('arrival_stall_max_distance_m').value
+        )
         self.camera_to_arm_transform_enabled = bool(
             self.get_parameter('camera_to_arm_transform_enabled').value
         )
@@ -252,11 +275,17 @@ class ArmSerialBridgeNode(Node):
             camera_offset_x_m=float(self.get_parameter('camera_offset_x_m').value),
             camera_offset_y_m=float(self.get_parameter('camera_offset_y_m').value),
             camera_offset_z_m=float(self.get_parameter('camera_offset_z_m').value),
+            camera_tilt_forward_deg=float(
+                self.get_parameter('camera_tilt_forward_deg').value
+            ),
         )
         self.command_offset_m = (
             float(self.get_parameter('command_offset_x_m').value),
             float(self.get_parameter('command_offset_y_m').value),
             float(self.get_parameter('command_offset_z_m').value),
+        )
+        self.command_abs_y_offset_m = abs(
+            float(self.get_parameter('command_abs_y_offset_m').value)
         )
         self.serial_tx_log = bool(self.get_parameter('serial_tx_log').value)
         self.serial_tx_log_hex = bool(self.get_parameter('serial_tx_log_hex').value)
@@ -288,6 +317,9 @@ class ArmSerialBridgeNode(Node):
         self._active_target: tuple[float, float, float] | None = None
         self._hold_target: tuple[float, float, float] | None = None
         self._reach_count = 0
+        self._mcu_reached_count = 0
+        self._stall_count = 0
+        self._last_arrival_end_xyz: tuple[float, float, float] | None = None
         self._delay_start_time: float | None = None
         self._pump_command_sent = False
         self._last_detection_warn_time = 0.0
@@ -319,10 +351,16 @@ class ArmSerialBridgeNode(Node):
             f'reach_tolerance={self.reach_tolerance_m:.3f}m, '
             f'detection_timeout={self.detection_timeout_sec:.2f}s, '
             f'feedback_timeout={self.feedback_timeout_sec:.2f}s, '
+            f'arrival_stall={self.arrival_stall_enabled}, '
+            f'stall_epsilon={self.arrival_stall_epsilon_m:.3f}m, '
+            f'stall_frames={self.arrival_stall_frames}, '
+            f'stall_max_dist={self.arrival_stall_max_distance_m:.3f}m, '
             f'transform_enabled={self.camera_to_arm_transform_enabled}, '
+            f'camera_tilt_forward={self.vision_transform.camera_tilt_forward_deg:.1f}deg, '
             f'command_offset=({self.command_offset_m[0]:.3f}, '
             f'{self.command_offset_m[1]:.3f}, '
             f'{self.command_offset_m[2]:.3f})m, '
+            f'command_abs_y_offset={self.command_abs_y_offset_m:.3f}m, '
             f'place=({self._place_target[0]:.3f}, '
             f'{self._place_target[1]:.3f}, '
             f'{self._place_target[2]:.3f})m'
@@ -476,7 +514,7 @@ class ArmSerialBridgeNode(Node):
             if self._bridge_state == BridgeState.WAIT_DETECTION:
                 self._active_target = None
                 self._hold_target = None
-                self._reach_count = 0
+                self._reset_arrival_tracking()
                 self._set_state(BridgeState.SEND_GRASP)
 
     # ------------------------------------------------------------------
@@ -534,27 +572,31 @@ class ArmSerialBridgeNode(Node):
         )
         target = self._apply_command_offset(target)
 
-        if self._send_target_immediate(
+        sent = self._send_target_immediate(
             target, target_type=TARGET_TYPE_GRASP, tag='grasp', now=now
-        ):
+        )
+        if sent:
             self._active_target = target
             self._hold_target = target
+        if self._active_target is not None:
             self._update_arrival(
                 now,
-                target,
+                self._active_target,
                 reached_state=BridgeState.GRASP_DELAY,
             )
 
     def _maybe_send_place(self, now: float):
         target = self._place_target_command
-        if self._send_target_immediate(
+        sent = self._send_target_immediate(
             target, target_type=TARGET_TYPE_PLACE, tag='place', now=now
-        ):
+        )
+        if sent:
             self._active_target = target
             self._hold_target = target
+        if self._active_target is not None:
             self._update_arrival(
                 now,
-                target,
+                self._active_target,
                 reached_state=BridgeState.PLACE_DELAY,
             )
 
@@ -590,7 +632,7 @@ class ArmSerialBridgeNode(Node):
         if next_state == BridgeState.WAIT_DETECTION:
             self._reset_detection_state()
         self._set_state(next_state)
-        self._reach_count = 0
+        self._reset_arrival_tracking()
         self._delay_start_time = None
         self._active_target = None
         self._hold_target = None
@@ -656,11 +698,22 @@ class ArmSerialBridgeNode(Node):
         self, target: tuple[float, float, float]
     ) -> tuple[float, float, float]:
         """Apply final mechanical command compensation before sending to MCU."""
+        y_with_offset = target[1] + self.command_offset_m[1]
+        y_command = self._increase_signed_magnitude(
+            y_with_offset, self.command_abs_y_offset_m
+        )
         return (
             target[0] + self.command_offset_m[0],
-            target[1] + self.command_offset_m[1],
+            y_command,
             target[2] + self.command_offset_m[2],
         )
+
+    @staticmethod
+    def _increase_signed_magnitude(value: float, delta: float) -> float:
+        """Preserve y direction while compensating measured lateral reach error."""
+        if value < 0.0:
+            return value - delta
+        return value + delta
 
     def _update_arrival(
         self,
@@ -669,21 +722,70 @@ class ArmSerialBridgeNode(Node):
         reached_state: BridgeState,
     ):
         if not self._has_fresh_feedback(now) or self._latest_feedback is None:
-            self._reach_count = 0
+            self._reset_arrival_tracking()
             return
 
-        dist_m = distance(self._latest_feedback.end_xyz_m, target)
+        feedback = self._latest_feedback
+        dist_m = distance(feedback.end_xyz_m, target)
         if dist_m <= self.reach_tolerance_m:
             self._reach_count += 1
         else:
             self._reach_count = 0
 
+        if (
+            self.arrival_accept_mcu_reached
+            and feedback.arm_state == ARM_STATE_REACHED
+        ):
+            self._mcu_reached_count += 1
+        else:
+            self._mcu_reached_count = 0
+
+        if self._is_arrival_stalled(feedback.end_xyz_m, dist_m):
+            self._stall_count += 1
+        else:
+            self._stall_count = 0
+
+        reason = None
         if self._reach_count >= self.reach_stable_frames:
+            reason = 'distance'
+        elif self._mcu_reached_count >= self.reach_stable_frames:
+            reason = 'mcu_reached'
+        elif self._stall_count >= self.arrival_stall_frames:
+            reason = 'stall'
+
+        if reason is not None:
+            self.get_logger().info(f'Arrival detected by {reason}')
             self._delay_start_time = None
             self._hold_target = target
-            self._reach_count = 0
+            self._reset_arrival_tracking()
             self._pump_command_sent = False
             self._set_state(reached_state)
+
+    def _is_arrival_stalled(
+        self,
+        end_xyz_m: tuple[float, float, float],
+        dist_to_target_m: float,
+    ) -> bool:
+        """Treat a near-target stopped end-effector as contact with the object."""
+        if not self.arrival_stall_enabled:
+            self._last_arrival_end_xyz = end_xyz_m
+            return False
+        if dist_to_target_m > self.arrival_stall_max_distance_m:
+            self._last_arrival_end_xyz = end_xyz_m
+            return False
+        if self._last_arrival_end_xyz is None:
+            self._last_arrival_end_xyz = end_xyz_m
+            return False
+
+        moved_m = distance(end_xyz_m, self._last_arrival_end_xyz)
+        self._last_arrival_end_xyz = end_xyz_m
+        return moved_m <= self.arrival_stall_epsilon_m
+
+    def _reset_arrival_tracking(self):
+        self._reach_count = 0
+        self._mcu_reached_count = 0
+        self._stall_count = 0
+        self._last_arrival_end_xyz = None
 
     def _send_pump_for_delay(self, target_type: int):
         if self._pump_command_sent:
@@ -740,7 +842,7 @@ class ArmSerialBridgeNode(Node):
         self._reset_detection_state()
         self._active_target = None
         self._hold_target = None
-        self._reach_count = 0
+        self._reset_arrival_tracking()
         self._set_state(BridgeState.WAIT_DETECTION)
 
     def _reset_detection_state(self):

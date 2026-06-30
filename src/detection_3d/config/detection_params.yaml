@@ -44,9 +44,10 @@ detection_3d_calculator:
     depth_estimator_mode: "cluster_centroid"
 
     # ---- coordinate stability ----
-    max_depth_variance_m2: 0.0004
-    coordinate_jump_threshold_m: 0.05
-    stable_window_size: 5
+    max_depth_variance_m2: 0.0002
+    coordinate_jump_threshold_m: 0.03
+    stable_window_size: 7
+    coordinate_output_mode: "median"
 
 # ============================================
 # Estimator Comparison Logger Parameters
@@ -83,8 +84,8 @@ arm_serial_bridge:
     send_rate: 10.0
     detection_topic: "/detection/detections_3d"
     target_class: ""
-    ema_alpha: 0.25
-    stable_radius_m: 0.02
+    ema_alpha: 0.20
+    stable_radius_m: 0.015
     stable_frames: 3
     max_send_rate: 5.0
     read_feedback: true
@@ -93,13 +94,20 @@ arm_serial_bridge:
     arrival_delay_sec: 1.0
     feedback_timeout_sec: 0.5
     detection_timeout_sec: 0.5
+    arrival_accept_mcu_reached: true
+    arrival_stall_enabled: true
+    arrival_stall_epsilon_m: 0.003
+    arrival_stall_frames: 5
+    arrival_stall_max_distance_m: 0.08
     camera_to_arm_transform_enabled: true
     camera_offset_x_m: 0.105
     camera_offset_y_m: 0.0
     camera_offset_z_m: -0.078
+    camera_tilt_forward_deg: 45.0
     command_offset_x_m: 0.0
     command_offset_y_m: 0.0
     command_offset_z_m: 0.09
+    command_abs_y_offset_m: 0.0
     serial_tx_log: true
     serial_tx_log_hex: false
 

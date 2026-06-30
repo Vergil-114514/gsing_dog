@@ -1,7 +1,7 @@
 """Camera-to-arm-base coordinate transform used before sending targets to MCU."""
 
 from dataclasses import dataclass
-from math import cos, sin
+from math import cos, radians, sin
 
 
 @dataclass(frozen=True)
@@ -9,13 +9,15 @@ class VisionTransformConfig:
     """
     Parameters for reproducing the MCU vision coordinate transform.
 
-    Only fixed camera mounting offsets belong in config. The current arm pose
-    and theta1 must come from fresh MCU feedback at send time.
+    Only fixed camera mounting offsets and mounting angle belong in config.
+    The current arm pose and theta1 must come from fresh MCU feedback at send
+    time.
     """
 
     camera_offset_x_m: float = 0.105
     camera_offset_y_m: float = 0.0
     camera_offset_z_m: float = -0.078
+    camera_tilt_forward_deg: float = 45.0
 
 
 def transform_camera_to_arm_base(
@@ -30,6 +32,8 @@ def transform_camera_to_arm_base(
     Args:
         camera_xyz_m: Target coordinate from the 3D detector in meters.
         config: Fixed camera mounting offsets.
+            Positive tilt means the optical axis leans from vertical down
+            toward the local arm +x_e direction.
         theta1_rad: Current base yaw from MCU feedback.
         current_end_xyz_m: Current end-effector xyz from MCU feedback.
 
@@ -38,9 +42,13 @@ def transform_camera_to_arm_base(
     """
     cam_x_m, cam_y_m, cam_z_m = camera_xyz_m
 
-    x_e = cam_y_m + config.camera_offset_x_m
+    tilt_rad = radians(config.camera_tilt_forward_deg)
+    cos_tilt = cos(tilt_rad)
+    sin_tilt = sin(tilt_rad)
+
+    x_e = (cam_y_m * cos_tilt) + (cam_z_m * sin_tilt) + config.camera_offset_x_m
     y_e = cam_x_m + config.camera_offset_y_m
-    z_e = -cam_z_m + config.camera_offset_z_m
+    z_e = (cam_y_m * sin_tilt) - (cam_z_m * cos_tilt) + config.camera_offset_z_m
 
     cos_t1 = cos(theta1_rad)
     sin_t1 = sin(theta1_rad)

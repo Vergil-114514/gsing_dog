@@ -75,9 +75,10 @@ class Detection3DCalculatorNode(Node):
         self.declare_parameter('depth_estimator_mode', 'cluster_centroid')
 
         # ---- new: stability ----
-        self.declare_parameter('max_depth_variance_m2', 0.01)
-        self.declare_parameter('coordinate_jump_threshold_m', 0.05)
-        self.declare_parameter('stable_window_size', 5)
+        self.declare_parameter('max_depth_variance_m2', 0.0002)
+        self.declare_parameter('coordinate_jump_threshold_m', 0.03)
+        self.declare_parameter('stable_window_size', 7)
+        self.declare_parameter('coordinate_output_mode', 'median')
 
         # === resolve ===
 
@@ -125,6 +126,9 @@ class Detection3DCalculatorNode(Node):
         self.max_depth_variance_m2 = float(self.get_parameter('max_depth_variance_m2').value)
         self.jump_threshold_m = float(self.get_parameter('coordinate_jump_threshold_m').value)
         stable_window_size = int(self.get_parameter('stable_window_size').value)
+        coordinate_output_mode = str(
+            self.get_parameter('coordinate_output_mode').value
+        ).strip().lower()
 
         # === camera intrinsics (populated from CameraInfo) ===
         self.fx: float | None = None
@@ -140,6 +144,7 @@ class Detection3DCalculatorNode(Node):
         self._stabilizer = CoordinateStabilizer(
             window_size=stable_window_size,
             max_variance_m2=self.max_depth_variance_m2,
+            output_mode=coordinate_output_mode,
         )
         self._prev_best_pos: tuple[float, float, float] | None = None
         self._prev_best_class: str = ""
@@ -174,7 +179,9 @@ class Detection3DCalculatorNode(Node):
             f'cluster_tol={self.depth_cluster_tolerance_m}m, '
             f'min_cluster_ratio={self.depth_min_cluster_ratio}, '
             f'valid_ratio>={self.min_depth_valid_ratio}, '
-            f'stable_window={stable_window_size}, jump_thresh={self.jump_threshold_m}m, '
+            f'stable_window={stable_window_size}, '
+            f'coord_output={coordinate_output_mode}, '
+            f'jump_thresh={self.jump_threshold_m}m, '
             f'source_res={self.source_w}x{self.source_h}, '
             f'depth_pixel_offset=({self.depth_pixel_offset_x_px:.2f}, '
             f'{self.depth_pixel_offset_y_px:.2f})px'

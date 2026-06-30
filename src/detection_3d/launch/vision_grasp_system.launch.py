@@ -58,6 +58,10 @@ def generate_launch_description():
         'serial_tx_log_hex', default_value='false',
         description='Print complete serial TX frames in hex',
     )
+    camera_tilt_forward_arg = DeclareLaunchArgument(
+        'camera_tilt_forward_deg', default_value='45.0',
+        description='Camera optical axis tilt from vertical down toward arm +x_e',
+    )
     command_offset_x_arg = DeclareLaunchArgument(
         'command_offset_x_m', default_value='0.0',
         description='Final x command offset applied before serial TX',
@@ -69,6 +73,10 @@ def generate_launch_description():
     command_offset_z_arg = DeclareLaunchArgument(
         'command_offset_z_m', default_value='0.09',
         description='Final z command offset applied before serial TX',
+    )
+    command_abs_y_offset_arg = DeclareLaunchArgument(
+        'command_abs_y_offset_m', default_value='0.0',
+        description='Increase absolute y command magnitude before serial TX',
     )
 
     camera_launch = IncludeLaunchDescription(
@@ -111,9 +119,11 @@ def generate_launch_description():
             'debug_projection_log': LaunchConfiguration('debug_projection_log'),
             'serial_tx_log': LaunchConfiguration('serial_tx_log'),
             'serial_tx_log_hex': LaunchConfiguration('serial_tx_log_hex'),
+            'camera_tilt_forward_deg': LaunchConfiguration('camera_tilt_forward_deg'),
             'command_offset_x_m': LaunchConfiguration('command_offset_x_m'),
             'command_offset_y_m': LaunchConfiguration('command_offset_y_m'),
             'command_offset_z_m': LaunchConfiguration('command_offset_z_m'),
+            'command_abs_y_offset_m': LaunchConfiguration('command_abs_y_offset_m'),
         }.items(),
     )
 
@@ -128,9 +138,11 @@ def generate_launch_description():
         debug_projection_log_arg,
         serial_tx_log_arg,
         serial_tx_log_hex_arg,
+        camera_tilt_forward_arg,
         command_offset_x_arg,
         command_offset_y_arg,
         command_offset_z_arg,
+        command_abs_y_offset_arg,
         camera_launch,
         detection_launch,
     ])

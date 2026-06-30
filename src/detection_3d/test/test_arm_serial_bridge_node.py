@@ -1,9 +1,11 @@
 import pytest
 
 from detection_3d.arm_serial_bridge_node import ArmSerialBridgeNode, BridgeState
+from detection_3d.target_filter import distance
 from detection_3d.protocol import (
     ARM_STATE_ERROR,
     ARM_STATE_MOVING,
+    ARM_STATE_REACHED,
     ArmFeedback,
     FUNC_PUMP_CONTROL,
     PUMP_OFF,
@@ -83,6 +85,9 @@ def _make_node() -> ArmSerialBridgeNode:
     node._active_target = None
     node._hold_target = None
     node._reach_count = 0
+    node._mcu_reached_count = 0
+    node._stall_count = 0
+    node._last_arrival_end_xyz = None
     node._delay_start_time = None
     node._pump_command_sent = False
     node._last_feedback_warn_time = 0.0
@@ -96,6 +101,11 @@ def _make_node() -> ArmSerialBridgeNode:
     node.arrival_delay_sec = 1.0
     node.feedback_timeout_sec = 0.5
     node.detection_timeout_sec = 0.5
+    node.arrival_accept_mcu_reached = True
+    node.arrival_stall_enabled = True
+    node.arrival_stall_epsilon_m = 0.003
+    node.arrival_stall_frames = 5
+    node.arrival_stall_max_distance_m = 0.08
     node.target_class = ''
     node.camera_to_arm_transform_enabled = True
     node.vision_transform = VisionTransformConfig(
@@ -104,6 +114,7 @@ def _make_node() -> ArmSerialBridgeNode:
         camera_offset_z_m=-0.078,
     )
     node.command_offset_m = (0.0, 0.0, 0.09)
+    node.command_abs_y_offset_m = 0.0
     node.serial_tx_log = True
     node.serial_tx_log_hex = False
     node._place_target = (-0.1, 0.111, 0.42)
@@ -189,7 +200,7 @@ def test_grasp_send_uses_latest_feedback_transform(monkeypatch):
     node._maybe_send_grasp(now=10.1)
 
     assert len(sent) == 1
-    assert sent[0][0] == pytest.approx((0.325, -0.09, 0.162))
+    assert sent[0][0] == pytest.approx((0.425208153, -0.09, 0.220076118))
     assert sent[0][1] == TARGET_TYPE_GRASP
     assert sent[0][2] == 'grasp'
 
@@ -316,6 +327,205 @@ def test_reaching_grasp_target_enters_delay_then_place(monkeypatch):
     )
 
     assert node._bridge_state == BridgeState.SEND_PLACE
+
+
+def test_mcu_reached_state_can_complete_arrival_when_short_of_target():
+    node = _make_node()
+    node.reach_stable_frames = 2
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_REACHED,
+        end_xyz_m=(0.0, 0.0, 0.0),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+    target = (0.05, 0.0, 0.0)
+
+    node._update_arrival(
+        now=10.0,
+        target=target,
+        reached_state=BridgeState.GRASP_DELAY,
+    )
+    assert node._bridge_state == BridgeState.SEND_GRASP
+
+    node._update_arrival(
+        now=10.1,
+        target=target,
+        reached_state=BridgeState.GRASP_DELAY,
+    )
+
+    assert node._bridge_state == BridgeState.GRASP_DELAY
+    assert ('info', 'Arrival detected by mcu_reached') in node._logger.messages
+
+
+def test_grasp_arrival_is_checked_even_when_target_send_is_skipped(monkeypatch):
+    node = _make_node()
+    node.reach_stable_frames = 1
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_stable_camera_target = (0.0, 0.0, 0.0)
+    node._last_detection_time = 10.0
+    node.vision_transform = VisionTransformConfig(
+        camera_offset_x_m=0.0,
+        camera_offset_y_m=0.0,
+        camera_offset_z_m=0.0,
+        camera_tilt_forward_deg=0.0,
+    )
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_REACHED,
+        end_xyz_m=(0.2, -0.1, 0.3),
+        theta1_rad=0.0,
+    )
+    node._active_target = (0.2, -0.1, 0.39)
+    node._hold_target = node._active_target
+    node._last_feedback_time = 10.0
+    monkeypatch.setattr(node, '_send_target_immediate', lambda *args, **kwargs: False)
+
+    node._maybe_send_grasp(now=10.0)
+
+    assert node._bridge_state == BridgeState.GRASP_DELAY
+    assert ('info', 'Arrival detected by mcu_reached') in node._logger.messages
+
+
+def test_stalled_end_effector_can_complete_arrival_near_target():
+    node = _make_node()
+    node.arrival_stall_frames = 2
+    node._bridge_state = BridgeState.SEND_GRASP
+    target = (0.05, 0.0, 0.0)
+
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.02, 0.0, 0.0),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+    node._update_arrival(
+        now=10.0,
+        target=target,
+        reached_state=BridgeState.GRASP_DELAY,
+    )
+
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.021, 0.0, 0.0),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.1
+    node._update_arrival(
+        now=10.1,
+        target=target,
+        reached_state=BridgeState.GRASP_DELAY,
+    )
+    assert node._bridge_state == BridgeState.SEND_GRASP
+
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.0215, 0.0, 0.0),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.2
+    node._update_arrival(
+        now=10.2,
+        target=target,
+        reached_state=BridgeState.GRASP_DELAY,
+    )
+
+    assert node._bridge_state == BridgeState.GRASP_DELAY
+    assert ('info', 'Arrival detected by stall') in node._logger.messages
+
+
+def test_stalled_end_effector_too_far_from_target_does_not_arrive():
+    node = _make_node()
+    node.arrival_stall_frames = 2
+    node._bridge_state = BridgeState.SEND_GRASP
+    target = (0.20, 0.0, 0.0)
+
+    for now in (10.0, 10.1, 10.2):
+        node._latest_feedback = ArmFeedback(
+            arm_state=ARM_STATE_MOVING,
+            end_xyz_m=(0.0, 0.0, 0.0),
+            theta1_rad=0.0,
+        )
+        node._last_feedback_time = now
+        node._update_arrival(
+            now=now,
+            target=target,
+            reached_state=BridgeState.GRASP_DELAY,
+        )
+
+    assert node._bridge_state == BridgeState.SEND_GRASP
+
+
+def test_arrival_feedback_timeout_resets_extended_arrival_counts():
+    node = _make_node()
+    node.reach_stable_frames = 1
+    node.arrival_stall_frames = 1
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_REACHED,
+        end_xyz_m=(0.02, 0.0, 0.0),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 9.0
+    node._mcu_reached_count = 1
+    node._stall_count = 1
+    node._last_arrival_end_xyz = (0.02, 0.0, 0.0)
+
+    node._update_arrival(
+        now=10.0,
+        target=(0.05, 0.0, 0.0),
+        reached_state=BridgeState.GRASP_DELAY,
+    )
+
+    assert node._bridge_state == BridgeState.SEND_GRASP
+    assert node._mcu_reached_count == 0
+    assert node._stall_count == 0
+    assert node._last_arrival_end_xyz is None
+
+
+def test_place_arrival_can_use_stall_detection():
+    node = _make_node()
+    node.arrival_stall_frames = 2
+    node._bridge_state = BridgeState.SEND_PLACE
+    target = node._place_target_command
+    near_place = (target[0] + 0.03, target[1], target[2])
+
+    for now, x_offset in ((10.0, 0.03), (10.1, 0.029), (10.2, 0.0285)):
+        node._latest_feedback = ArmFeedback(
+            arm_state=ARM_STATE_MOVING,
+            end_xyz_m=(target[0] + x_offset, target[1], target[2]),
+            theta1_rad=0.0,
+        )
+        node._last_feedback_time = now
+        node._update_arrival(
+            now=now,
+            target=target,
+            reached_state=BridgeState.PLACE_DELAY,
+        )
+
+    assert distance(near_place, target) <= node.arrival_stall_max_distance_m
+    assert node._bridge_state == BridgeState.PLACE_DELAY
+
+
+def test_place_arrival_is_checked_even_when_target_send_fails(monkeypatch):
+    node = _make_node()
+    node.arrival_stall_frames = 2
+    node._bridge_state = BridgeState.SEND_PLACE
+    target = node._place_target_command
+    node._active_target = target
+    node._hold_target = target
+    monkeypatch.setattr(node, '_send_target_immediate', lambda *args, **kwargs: False)
+
+    for now, x_offset in ((10.0, 0.03), (10.1, 0.029), (10.2, 0.0285)):
+        node._latest_feedback = ArmFeedback(
+            arm_state=ARM_STATE_MOVING,
+            end_xyz_m=(target[0] + x_offset, target[1], target[2]),
+            theta1_rad=0.0,
+        )
+        node._last_feedback_time = now
+        node._maybe_send_place(now=now)
+
+    assert node._bridge_state == BridgeState.PLACE_DELAY
+    assert ('info', 'Arrival detected by stall') in node._logger.messages
 
 
 def test_grasp_delay_sends_pump_on_once(monkeypatch):
@@ -464,9 +674,26 @@ def test_place_send_ignores_stale_detection(monkeypatch):
 def test_command_offset_applies_all_axes():
     node = _make_node()
     node.command_offset_m = (0.01, -0.02, 0.09)
+    node.command_abs_y_offset_m = 0.0
 
     assert node._apply_command_offset((0.1, 0.2, 0.3)) == pytest.approx(
         (0.11, 0.18, 0.39)
+    )
+
+
+def test_command_abs_y_offset_increases_signed_magnitude():
+    node = _make_node()
+    node.command_offset_m = (0.0, 0.0, 0.0)
+    node.command_abs_y_offset_m = 0.25
+
+    assert node._apply_command_offset((0.0, 0.2, 0.0)) == pytest.approx(
+        (0.0, 0.45, 0.0)
+    )
+    assert node._apply_command_offset((0.0, -0.2, 0.0)) == pytest.approx(
+        (0.0, -0.45, 0.0)
+    )
+    assert node._apply_command_offset((0.0, 0.0, 0.0)) == pytest.approx(
+        (0.0, 0.25, 0.0)
     )
 
 
