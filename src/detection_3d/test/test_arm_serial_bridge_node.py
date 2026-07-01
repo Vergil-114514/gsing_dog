@@ -3,9 +3,7 @@ import pytest
 from detection_3d.arm_serial_bridge_node import ArmSerialBridgeNode, BridgeState
 from detection_3d.target_filter import distance
 from detection_3d.protocol import (
-    ARM_STATE_ERROR,
     ARM_STATE_MOVING,
-    ARM_STATE_REACHED,
     ArmFeedback,
     FUNC_PUMP_CONTROL,
     PUMP_OFF,
@@ -85,7 +83,6 @@ def _make_node() -> ArmSerialBridgeNode:
     node._active_target = None
     node._hold_target = None
     node._reach_count = 0
-    node._mcu_reached_count = 0
     node._stall_count = 0
     node._last_arrival_end_xyz = None
     node._delay_start_time = None
@@ -101,7 +98,6 @@ def _make_node() -> ArmSerialBridgeNode:
     node.arrival_delay_sec = 1.0
     node.feedback_timeout_sec = 0.5
     node.detection_timeout_sec = 0.5
-    node.arrival_accept_mcu_reached = True
     node.arrival_stall_enabled = True
     node.arrival_stall_epsilon_m = 0.05
     node.arrival_stall_frames = 4
@@ -329,12 +325,13 @@ def test_reaching_grasp_target_enters_delay_then_place(monkeypatch):
     assert node._bridge_state == BridgeState.SEND_PLACE
 
 
-def test_mcu_reached_state_can_complete_arrival_when_short_of_target():
+def test_arm_state_two_does_not_complete_arrival_by_itself():
     node = _make_node()
     node.reach_stable_frames = 2
+    node.arrival_stall_enabled = False
     node._bridge_state = BridgeState.SEND_GRASP
     node._latest_feedback = ArmFeedback(
-        arm_state=ARM_STATE_REACHED,
+        arm_state=2,
         end_xyz_m=(0.0, 0.0, 0.0),
         theta1_rad=0.0,
     )
@@ -354,8 +351,13 @@ def test_mcu_reached_state_can_complete_arrival_when_short_of_target():
         reached_state=BridgeState.GRASP_DELAY,
     )
 
-    assert node._bridge_state == BridgeState.GRASP_DELAY
-    assert ('info', 'Arrival detected by mcu_reached') in node._logger.messages
+    assert node._bridge_state == BridgeState.SEND_GRASP
+    assert not any(
+        message == 'Arrival detected by distance'
+        or message == 'Arrival detected by stall'
+        for level, message in node._logger.messages
+        if level == 'info'
+    )
 
 
 def test_grasp_arrival_is_checked_even_when_target_send_is_skipped(monkeypatch):
@@ -371,8 +373,8 @@ def test_grasp_arrival_is_checked_even_when_target_send_is_skipped(monkeypatch):
         camera_tilt_forward_deg=0.0,
     )
     node._latest_feedback = ArmFeedback(
-        arm_state=ARM_STATE_REACHED,
-        end_xyz_m=(0.2, -0.1, 0.3),
+        arm_state=2,
+        end_xyz_m=(0.2, -0.1, 0.39),
         theta1_rad=0.0,
     )
     node._active_target = (0.2, -0.1, 0.39)
@@ -383,7 +385,7 @@ def test_grasp_arrival_is_checked_even_when_target_send_is_skipped(monkeypatch):
     node._maybe_send_grasp(now=10.0)
 
     assert node._bridge_state == BridgeState.GRASP_DELAY
-    assert ('info', 'Arrival detected by mcu_reached') in node._logger.messages
+    assert ('info', 'Arrival detected by distance') in node._logger.messages
 
 
 def test_stalled_end_effector_can_complete_arrival_near_target():
@@ -461,12 +463,11 @@ def test_arrival_feedback_timeout_resets_extended_arrival_counts():
     node.arrival_stall_frames = 1
     node._bridge_state = BridgeState.SEND_GRASP
     node._latest_feedback = ArmFeedback(
-        arm_state=ARM_STATE_REACHED,
+        arm_state=2,
         end_xyz_m=(0.02, 0.0, 0.0),
         theta1_rad=0.0,
     )
     node._last_feedback_time = 9.0
-    node._mcu_reached_count = 1
     node._stall_count = 1
     node._last_arrival_end_xyz = (0.02, 0.0, 0.0)
 
@@ -477,7 +478,6 @@ def test_arrival_feedback_timeout_resets_extended_arrival_counts():
     )
 
     assert node._bridge_state == BridgeState.SEND_GRASP
-    assert node._mcu_reached_count == 0
     assert node._stall_count == 0
     assert node._last_arrival_end_xyz is None
 
@@ -741,9 +741,10 @@ def test_serial_pump_log_contains_state():
     )
 
 
-def test_mcu_error_state_stops_sending(monkeypatch):
+def test_arm_state_error_does_not_stop_host_state_machine(monkeypatch):
     node = _make_node()
-    node._handle_arm_feedback(bytes([ARM_STATE_ERROR]) + b'\x00' * 16)
+    node._bridge_state = BridgeState.SEND_PLACE
+    node._handle_arm_feedback(bytes([3]) + b'\x00' * 16)
     sent = []
     monkeypatch.setattr(
         node,
@@ -751,7 +752,7 @@ def test_mcu_error_state_stops_sending(monkeypatch):
         lambda *args, **kwargs: sent.append((args, kwargs)) or True,
     )
 
-    node.send_timer_callback()
+    node._maybe_send_place(now=10.0)
 
-    assert node._bridge_state == BridgeState.ERROR
-    assert sent == []
+    assert node._bridge_state == BridgeState.SEND_PLACE
+    assert len(sent) == 1

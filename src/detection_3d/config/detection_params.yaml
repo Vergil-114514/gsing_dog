@@ -101,7 +101,6 @@ arm_serial_bridge:
     arrival_delay_sec: 1.0
     feedback_timeout_sec: 0.5
     detection_timeout_sec: 0.5
-    arrival_accept_mcu_reached: true
     arrival_stall_enabled: true
     arrival_stall_epsilon_m: 0.05
     arrival_stall_frames: 4

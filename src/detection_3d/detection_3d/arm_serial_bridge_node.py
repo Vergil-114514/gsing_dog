@@ -33,8 +33,6 @@ except ImportError:  # pragma: no cover - unit tests without ROS2 messages
 
 from detection_3d.place_targets import validate_place_targets, get_place_target
 from detection_3d.protocol import (
-    ARM_STATE_ERROR,
-    ARM_STATE_REACHED,
     FUNC_ARM_FEEDBACK,
     TARGET_TYPE_GRASP,
     TARGET_TYPE_PLACE,
@@ -57,7 +55,6 @@ class BridgeState(Enum):
     GRASP_DELAY = 'GRASP_DELAY'
     SEND_PLACE = 'SEND_PLACE'
     PLACE_DELAY = 'PLACE_DELAY'
-    ERROR = 'ERROR'
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +194,6 @@ class ArmSerialBridgeNode(Node):
         self.declare_parameter('arrival_delay_sec', 1.0)
         self.declare_parameter('feedback_timeout_sec', 0.5)
         self.declare_parameter('detection_timeout_sec', 0.5)
-        self.declare_parameter('arrival_accept_mcu_reached', True)
         self.declare_parameter('arrival_stall_enabled', True)
         self.declare_parameter('arrival_stall_epsilon_m', 0.05)
         self.declare_parameter('arrival_stall_frames', 4)
@@ -246,9 +242,6 @@ class ArmSerialBridgeNode(Node):
         )
         self.detection_timeout_sec = float(
             self.get_parameter('detection_timeout_sec').value
-        )
-        self.arrival_accept_mcu_reached = bool(
-            self.get_parameter('arrival_accept_mcu_reached').value
         )
         self.arrival_stall_enabled = bool(
             self.get_parameter('arrival_stall_enabled').value
@@ -317,7 +310,6 @@ class ArmSerialBridgeNode(Node):
         self._active_target: tuple[float, float, float] | None = None
         self._hold_target: tuple[float, float, float] | None = None
         self._reach_count = 0
-        self._mcu_reached_count = 0
         self._stall_count = 0
         self._last_arrival_end_xyz: tuple[float, float, float] | None = None
         self._delay_start_time: float | None = None
@@ -467,10 +459,6 @@ class ArmSerialBridgeNode(Node):
         self._latest_feedback = feedback
         self._last_feedback_time = time.monotonic()
 
-        if feedback.arm_state == ARM_STATE_ERROR:
-            self._set_state(BridgeState.ERROR)
-            self.get_logger().error('MCU arm_state=error; stop sending targets')
-
     # ------------------------------------------------------------------
     # Detection filtering
     # ------------------------------------------------------------------
@@ -526,8 +514,6 @@ class ArmSerialBridgeNode(Node):
         self._read_and_parse_feedback()
 
         now = time.monotonic()
-        if self._bridge_state == BridgeState.ERROR:
-            return
         if self._bridge_state == BridgeState.WAIT_DETECTION:
             return
         if self._bridge_state == BridgeState.SEND_GRASP:
@@ -732,14 +718,6 @@ class ArmSerialBridgeNode(Node):
         else:
             self._reach_count = 0
 
-        if (
-            self.arrival_accept_mcu_reached
-            and feedback.arm_state == ARM_STATE_REACHED
-        ):
-            self._mcu_reached_count += 1
-        else:
-            self._mcu_reached_count = 0
-
         if self._is_arrival_stalled(feedback.end_xyz_m, dist_m):
             self._stall_count += 1
         else:
@@ -748,8 +726,6 @@ class ArmSerialBridgeNode(Node):
         reason = None
         if self._reach_count >= self.reach_stable_frames:
             reason = 'distance'
-        elif self._mcu_reached_count >= self.reach_stable_frames:
-            reason = 'mcu_reached'
         elif self._stall_count >= self.arrival_stall_frames:
             reason = 'stall'
 
@@ -783,7 +759,6 @@ class ArmSerialBridgeNode(Node):
 
     def _reset_arrival_tracking(self):
         self._reach_count = 0
-        self._mcu_reached_count = 0
         self._stall_count = 0
         self._last_arrival_end_xyz = None
 
