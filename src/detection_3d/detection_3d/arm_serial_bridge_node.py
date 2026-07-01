@@ -10,6 +10,7 @@ from enum import Enum
 import glob
 import os
 import select
+from statistics import median
 import time
 
 try:
@@ -194,6 +195,9 @@ class ArmSerialBridgeNode(Node):
         self.declare_parameter('arrival_delay_sec', 1.0)
         self.declare_parameter('feedback_timeout_sec', 0.5)
         self.declare_parameter('detection_timeout_sec', 0.5)
+        self.declare_parameter('grasp_occlusion_hold_enabled', True)
+        self.declare_parameter('grasp_command_filter_window', 5)
+        self.declare_parameter('grasp_occlusion_timeout_sec', 3.0)
         self.declare_parameter('arrival_stall_enabled', True)
         self.declare_parameter('arrival_stall_epsilon_m', 0.05)
         self.declare_parameter('arrival_stall_frames', 4)
@@ -207,7 +211,7 @@ class ArmSerialBridgeNode(Node):
         self.declare_parameter('camera_tilt_forward_deg', 45.0)
         self.declare_parameter('command_offset_x_m', 0.0)
         self.declare_parameter('command_offset_y_m', 0.0)
-        self.declare_parameter('command_offset_z_m', 0.09)
+        self.declare_parameter('command_offset_z_m', 0.23)
         self.declare_parameter('command_abs_y_offset_m', 0.0)
         self.declare_parameter('serial_tx_log', True)
         self.declare_parameter('serial_tx_log_hex', False)
@@ -243,6 +247,15 @@ class ArmSerialBridgeNode(Node):
         self.detection_timeout_sec = float(
             self.get_parameter('detection_timeout_sec').value
         )
+        self.grasp_occlusion_hold_enabled = bool(
+            self.get_parameter('grasp_occlusion_hold_enabled').value
+        )
+        self.grasp_command_filter_window = max(
+            1, int(self.get_parameter('grasp_command_filter_window').value)
+        )
+        self.grasp_occlusion_timeout_sec = float(
+            self.get_parameter('grasp_occlusion_timeout_sec').value
+        )
         self.arrival_stall_enabled = bool(
             self.get_parameter('arrival_stall_enabled').value
         )
@@ -277,8 +290,8 @@ class ArmSerialBridgeNode(Node):
             float(self.get_parameter('command_offset_y_m').value),
             float(self.get_parameter('command_offset_z_m').value),
         )
-        self.command_abs_y_offset_m = abs(
-            float(self.get_parameter('command_abs_y_offset_m').value)
+        self.command_abs_y_offset_m = float(
+            self.get_parameter('command_abs_y_offset_m').value
         )
         self.serial_tx_log = bool(self.get_parameter('serial_tx_log').value)
         self.serial_tx_log_hex = bool(self.get_parameter('serial_tx_log_hex').value)
@@ -309,6 +322,8 @@ class ArmSerialBridgeNode(Node):
         self._last_feedback_time: float | None = None
         self._active_target: tuple[float, float, float] | None = None
         self._hold_target: tuple[float, float, float] | None = None
+        self._grasp_command_history: list[tuple[float, float, float]] = []
+        self._grasp_occlusion_start_time: float | None = None
         self._reach_count = 0
         self._stall_count = 0
         self._last_arrival_end_xyz: tuple[float, float, float] | None = None
@@ -343,6 +358,9 @@ class ArmSerialBridgeNode(Node):
             f'reach_tolerance={self.reach_tolerance_m:.3f}m, '
             f'detection_timeout={self.detection_timeout_sec:.2f}s, '
             f'feedback_timeout={self.feedback_timeout_sec:.2f}s, '
+            f'grasp_occlusion_hold={self.grasp_occlusion_hold_enabled}, '
+            f'grasp_occlusion_timeout={self.grasp_occlusion_timeout_sec:.2f}s, '
+            f'grasp_filter_window={self.grasp_command_filter_window}, '
             f'arrival_stall={self.arrival_stall_enabled}, '
             f'stall_epsilon={self.arrival_stall_epsilon_m:.3f}m, '
             f'stall_frames={self.arrival_stall_frames}, '
@@ -471,7 +489,7 @@ class ArmSerialBridgeNode(Node):
         ):
             return
         if not msg.detections:
-            self._drop_grasp_detection('empty detection message')
+            self._handle_missing_grasp_detection('empty detection message')
             return
 
         best = None
@@ -488,7 +506,7 @@ class ArmSerialBridgeNode(Node):
                 best = det
 
         if best is None:
-            self._drop_grasp_detection('no matching detection')
+            self._handle_missing_grasp_detection('no matching detection')
             return
 
         pos = best.results[0].pose.pose.position
@@ -499,11 +517,19 @@ class ArmSerialBridgeNode(Node):
         if stable is not None:
             self._latest_stable_camera_target = stable
             self._last_detection_time = time.monotonic()
+            self._grasp_occlusion_start_time = None
             if self._bridge_state == BridgeState.WAIT_DETECTION:
                 self._active_target = None
                 self._hold_target = None
                 self._reset_arrival_tracking()
                 self._set_state(BridgeState.SEND_GRASP)
+
+    def _handle_missing_grasp_detection(self, reason: str):
+        if self._bridge_state == BridgeState.SEND_GRASP and (
+            self.grasp_occlusion_hold_enabled and self._grasp_command_history
+        ):
+            return
+        self._drop_grasp_detection(reason)
 
     # ------------------------------------------------------------------
     # Timer state machine
@@ -529,20 +555,14 @@ class ArmSerialBridgeNode(Node):
         elif self._bridge_state == BridgeState.SEND_PLACE:
             self._maybe_send_place(now)
         elif self._bridge_state == BridgeState.PLACE_DELAY:
-            self._send_pump_for_delay(TARGET_TYPE_PLACE)
-            self._send_delay_hold(
-                now,
-                target_type=TARGET_TYPE_PLACE,
-                tag='place_hold',
-                next_state=BridgeState.WAIT_DETECTION,
-            )
+            self._send_place_delay_then_pump_off(now)
 
     def _maybe_send_grasp(self, now: float):
         if self._latest_stable_camera_target is None:
             return
         if not self._has_fresh_detection(now):
             self._warn_detection_timeout(now)
-            self._drop_grasp_detection('vision target timeout')
+            self._maybe_hold_occluded_grasp(now)
             return
         if not self._has_fresh_feedback(now):
             self._warn_feedback_timeout(now)
@@ -560,6 +580,41 @@ class ArmSerialBridgeNode(Node):
 
         sent = self._send_target_immediate(
             target, target_type=TARGET_TYPE_GRASP, tag='grasp', now=now
+        )
+        if sent:
+            self._active_target = target
+            self._hold_target = target
+            self._record_grasp_command(target)
+        if self._active_target is not None:
+            self._update_arrival(
+                now,
+                self._active_target,
+                reached_state=BridgeState.GRASP_DELAY,
+            )
+
+    def _maybe_hold_occluded_grasp(self, now: float):
+        if (
+            not self.grasp_occlusion_hold_enabled
+            or not self._grasp_command_history
+        ):
+            self._drop_grasp_detection('vision target timeout')
+            return
+        if not self._has_fresh_feedback(now):
+            self._warn_feedback_timeout(now)
+            return
+
+        if self._grasp_occlusion_start_time is None:
+            self._grasp_occlusion_start_time = now
+            self.get_logger().warn(
+                'Vision target occluded during grasp; holding filtered target'
+            )
+        elif now - self._grasp_occlusion_start_time > self.grasp_occlusion_timeout_sec:
+            self._drop_grasp_detection('vision occlusion timeout')
+            return
+
+        target = self._filtered_grasp_command()
+        sent = self._send_target_immediate(
+            target, target_type=TARGET_TYPE_GRASP, tag='grasp_occluded', now=now
         )
         if sent:
             self._active_target = target
@@ -622,6 +677,37 @@ class ArmSerialBridgeNode(Node):
         self._delay_start_time = None
         self._active_target = None
         self._hold_target = None
+        if next_state == BridgeState.WAIT_DETECTION:
+            self._reset_grasp_command_history()
+        self._pump_command_sent = False
+
+    def _send_place_delay_then_pump_off(self, now: float) -> None:
+        """Keep the placed block stable before releasing the pump."""
+        target = self._hold_target or self._place_target_command
+        self._send_target_immediate(
+            target,
+            target_type=TARGET_TYPE_PLACE,
+            tag='place_hold',
+            now=now,
+        )
+
+        if self._delay_start_time is None:
+            self._delay_start_time = now
+        if now - self._delay_start_time < self.arrival_delay_sec:
+            return
+
+        if not self._pump_command_sent:
+            if not self._send_pump_command(False):
+                return
+            self._pump_command_sent = True
+
+        self._reset_detection_state()
+        self._set_state(BridgeState.WAIT_DETECTION)
+        self._reset_arrival_tracking()
+        self._delay_start_time = None
+        self._active_target = None
+        self._hold_target = None
+        self._reset_grasp_command_history()
         self._pump_command_sent = False
 
     # ------------------------------------------------------------------
@@ -651,6 +737,19 @@ class ArmSerialBridgeNode(Node):
         self.last_send_time = now
         self._log_target_tx(frame, target, target_type, tag)
         return True
+
+    def _record_grasp_command(self, target: tuple[float, float, float]) -> None:
+        """Keep recent successful grasp commands for camera-occluded approach."""
+        self._grasp_command_history.append(target)
+        if len(self._grasp_command_history) > self.grasp_command_filter_window:
+            del self._grasp_command_history[0]
+
+    def _filtered_grasp_command(self) -> tuple[float, float, float]:
+        """Return the per-axis median of recent grasp commands."""
+        return tuple(
+            float(median(target[axis] for target in self._grasp_command_history))
+            for axis in range(3)
+        )
 
     def _has_fresh_detection(self, now: float) -> bool:
         if self._latest_stable_camera_target is None:
@@ -685,7 +784,7 @@ class ArmSerialBridgeNode(Node):
     ) -> tuple[float, float, float]:
         """Apply final mechanical command compensation before sending to MCU."""
         y_with_offset = target[1] + self.command_offset_m[1]
-        y_command = self._increase_signed_magnitude(
+        y_command = self._apply_signed_magnitude_offset(
             y_with_offset, self.command_abs_y_offset_m
         )
         return (
@@ -695,11 +794,11 @@ class ArmSerialBridgeNode(Node):
         )
 
     @staticmethod
-    def _increase_signed_magnitude(value: float, delta: float) -> float:
-        """Preserve y direction while compensating measured lateral reach error."""
-        if value < 0.0:
-            return value - delta
-        return value + delta
+    def _apply_signed_magnitude_offset(value: float, delta: float) -> float:
+        """Offset y magnitude without flipping direction when delta is negative."""
+        sign = -1.0 if value < 0.0 else 1.0
+        magnitude = max(0.0, abs(value) + delta)
+        return sign * magnitude
 
     def _update_arrival(
         self,
@@ -817,6 +916,7 @@ class ArmSerialBridgeNode(Node):
         self._reset_detection_state()
         self._active_target = None
         self._hold_target = None
+        self._reset_grasp_command_history()
         self._reset_arrival_tracking()
         self._set_state(BridgeState.WAIT_DETECTION)
 
@@ -825,6 +925,10 @@ class ArmSerialBridgeNode(Node):
         self.stability.reset()
         self._latest_stable_camera_target = None
         self._last_detection_time = None
+
+    def _reset_grasp_command_history(self):
+        self._grasp_command_history = []
+        self._grasp_occlusion_start_time = None
 
     # ------------------------------------------------------------------
 

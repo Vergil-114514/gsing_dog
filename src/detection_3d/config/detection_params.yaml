@@ -101,6 +101,9 @@ arm_serial_bridge:
     arrival_delay_sec: 1.0
     feedback_timeout_sec: 0.5
     detection_timeout_sec: 0.5
+    grasp_occlusion_hold_enabled: true
+    grasp_command_filter_window: 5
+    grasp_occlusion_timeout_sec: 3.0
     arrival_stall_enabled: true
     arrival_stall_epsilon_m: 0.05
     arrival_stall_frames: 4
@@ -112,7 +115,7 @@ arm_serial_bridge:
     camera_tilt_forward_deg: 45.0
     command_offset_x_m: 0.0
     command_offset_y_m: 0.0
-    command_offset_z_m: 0.09
+    command_offset_z_m: 0.23
     command_abs_y_offset_m: 0.0
     serial_tx_log: true
     serial_tx_log_hex: false

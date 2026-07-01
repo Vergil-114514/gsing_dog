@@ -82,6 +82,8 @@ def _make_node() -> ArmSerialBridgeNode:
     node._last_feedback_time = None
     node._active_target = None
     node._hold_target = None
+    node._grasp_command_history = []
+    node._grasp_occlusion_start_time = None
     node._reach_count = 0
     node._stall_count = 0
     node._last_arrival_end_xyz = None
@@ -98,6 +100,9 @@ def _make_node() -> ArmSerialBridgeNode:
     node.arrival_delay_sec = 1.0
     node.feedback_timeout_sec = 0.5
     node.detection_timeout_sec = 0.5
+    node.grasp_occlusion_hold_enabled = True
+    node.grasp_command_filter_window = 5
+    node.grasp_occlusion_timeout_sec = 3.0
     node.arrival_stall_enabled = True
     node.arrival_stall_epsilon_m = 0.05
     node.arrival_stall_frames = 4
@@ -109,7 +114,7 @@ def _make_node() -> ArmSerialBridgeNode:
         camera_offset_y_m=0.0,
         camera_offset_z_m=-0.078,
     )
-    node.command_offset_m = (0.0, 0.0, 0.09)
+    node.command_offset_m = (0.0, 0.0, 0.23)
     node.command_abs_y_offset_m = 0.0
     node.serial_tx_log = True
     node.serial_tx_log_hex = False
@@ -196,7 +201,7 @@ def test_grasp_send_uses_latest_feedback_transform(monkeypatch):
     node._maybe_send_grasp(now=10.1)
 
     assert len(sent) == 1
-    assert sent[0][0] == pytest.approx((0.425208153, -0.09, 0.220076118))
+    assert sent[0][0] == pytest.approx((0.425208153, -0.09, 0.360076118))
     assert sent[0][1] == TARGET_TYPE_GRASP
     assert sent[0][2] == 'grasp'
 
@@ -227,6 +232,112 @@ def test_grasp_target_timeout_clears_target_and_waits(monkeypatch):
     assert node._last_detection_time is None
 
 
+def test_grasp_target_timeout_holds_filtered_target_after_successful_send(monkeypatch):
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_stable_camera_target = (0.01, 0.02, 0.15)
+    node._last_detection_time = 9.0
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.0, 0.0, 0.0),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+    node.grasp_command_filter_window = 3
+    node._grasp_command_history = [
+        (0.10, 0.10, 0.10),
+        (0.30, 0.20, 0.20),
+        (0.20, 0.30, 0.40),
+    ]
+    sent = []
+    monkeypatch.setattr(
+        node,
+        '_send_target_immediate',
+        lambda target, target_type, tag, now=None: sent.append(
+            (target, target_type, tag)
+        ) or True,
+    )
+
+    node._maybe_send_grasp(now=10.0)
+
+    assert node._bridge_state == BridgeState.SEND_GRASP
+    assert sent == [((0.20, 0.20, 0.20), TARGET_TYPE_GRASP, 'grasp_occluded')]
+    assert node._active_target == pytest.approx((0.20, 0.20, 0.20))
+    assert node._hold_target == pytest.approx((0.20, 0.20, 0.20))
+
+
+def test_grasp_occlusion_hold_can_reach_delay_by_distance(monkeypatch):
+    node = _make_node()
+    node.reach_stable_frames = 1
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_stable_camera_target = (0.01, 0.02, 0.15)
+    node._last_detection_time = 9.0
+    node._grasp_command_history = [(0.20, 0.10, 0.30)]
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.20, 0.10, 0.30),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+    monkeypatch.setattr(node, '_send_target_immediate', lambda *args, **kwargs: True)
+
+    node._maybe_send_grasp(now=10.0)
+
+    assert node._bridge_state == BridgeState.GRASP_DELAY
+    assert ('info', 'Arrival detected by distance') in node._logger.messages
+
+
+def test_grasp_occlusion_hold_can_reach_delay_by_stall(monkeypatch):
+    node = _make_node()
+    node.arrival_stall_frames = 2
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_stable_camera_target = (0.01, 0.02, 0.15)
+    node._last_detection_time = 9.0
+    node._grasp_command_history = [(0.20, 0.10, 0.30)]
+    monkeypatch.setattr(node, '_send_target_immediate', lambda *args, **kwargs: True)
+
+    for now, end_x in ((10.0, 0.16), (10.1, 0.161), (10.2, 0.162)):
+        node._latest_feedback = ArmFeedback(
+            arm_state=ARM_STATE_MOVING,
+            end_xyz_m=(end_x, 0.10, 0.30),
+            theta1_rad=0.0,
+        )
+        node._last_feedback_time = now
+        node._maybe_send_grasp(now=now)
+
+    assert node._bridge_state == BridgeState.GRASP_DELAY
+    assert ('info', 'Arrival detected by stall') in node._logger.messages
+
+
+def test_grasp_occlusion_timeout_returns_to_wait_detection(monkeypatch):
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_stable_camera_target = (0.01, 0.02, 0.15)
+    node._last_detection_time = 9.0
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.0, 0.0, 0.0),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 14.0
+    node._grasp_command_history = [(0.20, 0.10, 0.30)]
+    node._grasp_occlusion_start_time = 10.0
+    node.grasp_occlusion_timeout_sec = 3.0
+    sent = []
+    monkeypatch.setattr(
+        node,
+        '_send_target_immediate',
+        lambda *args, **kwargs: sent.append((args, kwargs)) or True,
+    )
+
+    node._maybe_send_grasp(now=14.0)
+
+    assert sent == []
+    assert node._bridge_state == BridgeState.WAIT_DETECTION
+    assert node._grasp_command_history == []
+    assert node._grasp_occlusion_start_time is None
+
+
 def test_empty_detection_message_stops_grasp_send():
     node = _make_node()
     node._bridge_state = BridgeState.SEND_GRASP
@@ -237,6 +348,19 @@ def test_empty_detection_message_stops_grasp_send():
 
     assert node._bridge_state == BridgeState.WAIT_DETECTION
     assert node._latest_stable_camera_target is None
+
+
+def test_empty_detection_message_does_not_stop_occluded_grasp_hold():
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_stable_camera_target = (0.01, 0.02, 0.15)
+    node._last_detection_time = 10.0
+    node._grasp_command_history = [(0.20, 0.10, 0.30)]
+
+    node.detection_callback(_DetectionArray([]))
+
+    assert node._bridge_state == BridgeState.SEND_GRASP
+    assert node._latest_stable_camera_target == pytest.approx((0.01, 0.02, 0.15))
 
 
 def test_grasp_target_not_sent_when_feedback_is_stale(monkeypatch):
@@ -291,7 +415,7 @@ def test_reaching_grasp_target_enters_delay_then_place(monkeypatch):
     node._maybe_send_grasp(now=10.0)
 
     assert len(sent) == 1
-    assert sent[0][0] == pytest.approx((0.2, -0.1, 0.39))
+    assert sent[0][0] == pytest.approx((0.2, -0.1, 0.53))
     assert sent[0][1:] == (TARGET_TYPE_GRASP, 'grasp')
 
     node._latest_feedback = ArmFeedback(
@@ -374,10 +498,10 @@ def test_grasp_arrival_is_checked_even_when_target_send_is_skipped(monkeypatch):
     )
     node._latest_feedback = ArmFeedback(
         arm_state=2,
-        end_xyz_m=(0.2, -0.1, 0.39),
+        end_xyz_m=(0.2, -0.1, 0.53),
         theta1_rad=0.0,
     )
-    node._active_target = (0.2, -0.1, 0.39)
+    node._active_target = (0.2, -0.1, 0.53)
     node._hold_target = node._active_target
     node._last_feedback_time = 10.0
     monkeypatch.setattr(node, '_send_target_immediate', lambda *args, **kwargs: False)
@@ -544,10 +668,11 @@ def test_grasp_delay_sends_pump_on_once(monkeypatch):
     assert pump_frames[0][4] == PUMP_ON
 
 
-def test_place_delay_retries_pump_off_until_success(monkeypatch):
+def test_place_delay_sends_pump_off_after_delay_and_retries(monkeypatch):
     node = _make_node()
     node._bridge_state = BridgeState.PLACE_DELAY
     node._hold_target = node._place_target
+    node.arrival_delay_sec = 1.0
     frames = []
     attempts = {'count': 0}
 
@@ -560,13 +685,20 @@ def test_place_delay_retries_pump_off_until_success(monkeypatch):
 
     monkeypatch.setattr(node, '_write_frame', write_frame)
 
-    node.send_timer_callback()
+    node._send_place_delay_then_pump_off(now=10.0)
     assert node._pump_command_sent is False
-    assert node._delay_start_time is None
+    assert node._delay_start_time == pytest.approx(10.0)
 
-    node.send_timer_callback()
-    assert node._pump_command_sent is True
-    assert node._delay_start_time is not None
+    node._send_place_delay_then_pump_off(now=10.5)
+    assert attempts['count'] == 0
+
+    node._send_place_delay_then_pump_off(now=11.1)
+    assert node._pump_command_sent is False
+    assert node._bridge_state == BridgeState.PLACE_DELAY
+
+    node._send_place_delay_then_pump_off(now=11.2)
+    assert node._pump_command_sent is False
+    assert node._bridge_state == BridgeState.WAIT_DETECTION
 
     pump_frames = [frame for frame in frames if frame[2] == FUNC_PUMP_CONTROL]
     assert len(pump_frames) == 2
@@ -620,7 +752,7 @@ def test_place_target_is_not_camera_transformed(monkeypatch):
 
 def test_place_target_command_is_final_coordinate_without_command_offset():
     node = _make_node()
-    node.command_offset_m = (0.5, 0.5, 0.09)
+    node.command_offset_m = (0.5, 0.5, 0.23)
     node.command_abs_y_offset_m = 0.25
     node._place_target = (-0.257, -0.19, 0.3835)
     node._place_target_command = node._place_target
@@ -646,20 +778,27 @@ def test_reaching_place_target_waits_and_resets_to_detection(monkeypatch):
 
     assert node._bridge_state == BridgeState.PLACE_DELAY
 
-    node._pump_command_sent = True
-    node._delay_start_time = 10.0
-    node._send_delay_hold(
-        now=11.2,
-        target_type=TARGET_TYPE_PLACE,
-        tag='place_hold',
-        next_state=BridgeState.WAIT_DETECTION,
-    )
+    pump_frames = []
+
+    def write_frame(frame):
+        if frame[2] == FUNC_PUMP_CONTROL:
+            pump_frames.append(frame)
+        return True
+
+    monkeypatch.setattr(node, '_write_frame', write_frame)
+
+    node._send_place_delay_then_pump_off(now=10.0)
+    assert node._bridge_state == BridgeState.PLACE_DELAY
+    assert pump_frames == []
+
+    node._send_place_delay_then_pump_off(now=11.2)
 
     assert node._bridge_state == BridgeState.WAIT_DETECTION
     assert node._latest_stable_camera_target is None
     assert node._last_detection_time is None
     assert node.ema.reset_count == 1
     assert node.stability.reset_count == 1
+    assert pump_frames[-1][4] == PUMP_OFF
 
 
 def test_place_send_ignores_stale_detection(monkeypatch):
@@ -683,15 +822,15 @@ def test_place_send_ignores_stale_detection(monkeypatch):
 
 def test_command_offset_applies_all_axes():
     node = _make_node()
-    node.command_offset_m = (0.01, -0.02, 0.09)
+    node.command_offset_m = (0.01, -0.02, 0.23)
     node.command_abs_y_offset_m = 0.0
 
     assert node._apply_command_offset((0.1, 0.2, 0.3)) == pytest.approx(
-        (0.11, 0.18, 0.39)
+        (0.11, 0.18, 0.53)
     )
 
 
-def test_command_abs_y_offset_increases_signed_magnitude():
+def test_command_abs_y_offset_changes_signed_magnitude():
     node = _make_node()
     node.command_offset_m = (0.0, 0.0, 0.0)
     node.command_abs_y_offset_m = 0.25
@@ -704,6 +843,17 @@ def test_command_abs_y_offset_increases_signed_magnitude():
     )
     assert node._apply_command_offset((0.0, 0.0, 0.0)) == pytest.approx(
         (0.0, 0.25, 0.0)
+    )
+
+    node.command_abs_y_offset_m = -0.15
+    assert node._apply_command_offset((0.0, 0.2, 0.0)) == pytest.approx(
+        (0.0, 0.05, 0.0)
+    )
+    assert node._apply_command_offset((0.0, -0.2, 0.0)) == pytest.approx(
+        (0.0, -0.05, 0.0)
+    )
+    assert node._apply_command_offset((0.0, 0.1, 0.0)) == pytest.approx(
+        (0.0, 0.0, 0.0)
     )
 
 

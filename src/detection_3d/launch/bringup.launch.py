@@ -109,16 +109,28 @@ def generate_launch_description():
         description='Final y command offset applied before serial TX',
     )
     command_offset_z_arg = DeclareLaunchArgument(
-        'command_offset_z_m', default_value='0.09',
+        'command_offset_z_m', default_value='0.23',
         description='Final z command offset applied before serial TX',
     )
     command_abs_y_offset_arg = DeclareLaunchArgument(
         'command_abs_y_offset_m', default_value='0.0',
-        description='Increase absolute y command magnitude before serial TX',
+        description='Adjust absolute y command magnitude before serial TX; negative shrinks toward zero',
     )
     place_target_index_arg = DeclareLaunchArgument(
         'place_target_index', default_value='0',
         description='Index of fixed place target: 0=right-rear, 1=left-rear, 2=left-front, 3=right-front',
+    )
+    grasp_occlusion_hold_arg = DeclareLaunchArgument(
+        'grasp_occlusion_hold_enabled', default_value='true',
+        description='Keep sending filtered grasp command when vision is occluded',
+    )
+    grasp_command_filter_window_arg = DeclareLaunchArgument(
+        'grasp_command_filter_window', default_value='5',
+        description='Recent successful grasp commands used for occlusion median',
+    )
+    grasp_occlusion_timeout_arg = DeclareLaunchArgument(
+        'grasp_occlusion_timeout_sec', default_value='3.0',
+        description='Maximum seconds to hold grasp target after vision timeout',
     )
 
     # ---- Detection nodes ----
@@ -165,6 +177,15 @@ def generate_launch_description():
             'command_offset_z_m': LaunchConfiguration('command_offset_z_m'),
             'command_abs_y_offset_m': LaunchConfiguration('command_abs_y_offset_m'),
             'place_target_index': LaunchConfiguration('place_target_index'),
+            'grasp_occlusion_hold_enabled': LaunchConfiguration(
+                'grasp_occlusion_hold_enabled'
+            ),
+            'grasp_command_filter_window': LaunchConfiguration(
+                'grasp_command_filter_window'
+            ),
+            'grasp_occlusion_timeout_sec': LaunchConfiguration(
+                'grasp_occlusion_timeout_sec'
+            ),
         }],
         output='screen',
         condition=IfCondition(LaunchConfiguration('use_arm_bridge')),
@@ -240,6 +261,9 @@ def generate_launch_description():
         command_offset_z_arg,
         command_abs_y_offset_arg,
         place_target_index_arg,
+        grasp_occlusion_hold_arg,
+        grasp_command_filter_window_arg,
+        grasp_occlusion_timeout_arg,
         yolo_node,
         calc_node,
         arm_bridge_node,
