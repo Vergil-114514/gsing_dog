@@ -14,7 +14,7 @@ class TestCoordinateStabilizer:
         assert not s.is_ready
 
     def test_outputs_when_stable(self):
-        """Window full + low variance → returns median by default."""
+        """Window full + low variance → returns average."""
         s = CoordinateStabilizer(window_size=3, max_variance_m2=0.0004)
         s.update((0.1, 0.2, 0.5))
         s.update((0.11, 0.21, 0.51))
@@ -25,29 +25,13 @@ class TestCoordinateStabilizer:
         assert y == pytest.approx(0.20, abs=0.01)
         assert z == pytest.approx(0.50, abs=0.01)
 
-    def test_mean_output_mode_keeps_old_average_behavior(self):
-        """Explicit mean mode is kept for A/B testing against the old output."""
-        s = CoordinateStabilizer(
-            window_size=3,
-            max_variance_m2=0.01,
-            output_mode='mean',
-        )
+    def test_average_output_keeps_residual_jitter_visible(self):
+        """Average output matches the original stabilizer behavior."""
+        s = CoordinateStabilizer(window_size=3, max_variance_m2=0.01)
         s.update((0.1, 0.2, 0.5))
         s.update((0.1, 0.2, 0.5))
         result = s.update((0.16, 0.2, 0.5))
         assert result == pytest.approx((0.12, 0.2, 0.5))
-
-    def test_median_output_mode_rejects_residual_jitter(self):
-        """Median mode avoids pulling the output toward one valid jitter frame."""
-        s = CoordinateStabilizer(
-            window_size=3,
-            max_variance_m2=0.01,
-            output_mode='median',
-        )
-        s.update((0.1, 0.2, 0.5))
-        s.update((0.1, 0.2, 0.5))
-        result = s.update((0.16, 0.2, 0.5))
-        assert result == pytest.approx((0.1, 0.2, 0.5))
 
     def test_high_variance_rejected(self):
         """Window full but positions vary too much → None."""
@@ -86,12 +70,12 @@ class TestCoordinateStabilizer:
         assert result is not None  # window is now [0.1, 0.1, 0.1]
 
     def test_default_window_size(self):
-        """Default window_size=7."""
+        """Default window_size=5."""
         s = CoordinateStabilizer()
-        for _ in range(6):
+        for _ in range(4):
             assert s.update((0.0, 0.0, 0.0)) is None
         assert s.is_ready is False
-        # 7th frame fills the window
+        # 5th frame fills the window
         result = s.update((0.0, 0.0, 0.0))
         assert result is not None
         assert s.is_ready is True

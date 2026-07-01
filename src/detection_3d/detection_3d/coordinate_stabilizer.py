@@ -27,9 +27,8 @@ class CoordinateStabilizer:
 
     def __init__(
         self,
-        window_size: int = 7,
-        max_variance_m2: float = 0.0002,
-        output_mode: str = 'median',
+        window_size: int = 5,
+        max_variance_m2: float = 0.0004,
     ):
         """
         Args:
@@ -39,9 +38,6 @@ class CoordinateStabilizer:
         """
         self._window_size = max(window_size, 2)
         self._max_variance_m2 = float(max_variance_m2)
-        self._output_mode = output_mode.strip().lower()
-        if self._output_mode not in ('median', 'mean'):
-            self._output_mode = 'median'
         self._buffer: deque[tuple[float, float, float]] = deque(maxlen=self._window_size)
 
     def update(
@@ -65,11 +61,8 @@ class CoordinateStabilizer:
         if variance > self._max_variance_m2:
             return None
 
-        if self._output_mode == 'mean':
-            output = np.mean(arr, axis=0)
-        else:
-            output = np.median(arr, axis=0)
-        return (float(output[0]), float(output[1]), float(output[2]))
+        mean = np.mean(arr, axis=0)
+        return (float(mean[0]), float(mean[1]), float(mean[2]))
 
     @property
     def is_ready(self) -> bool:

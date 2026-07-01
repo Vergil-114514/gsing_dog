@@ -37,17 +37,20 @@ detection_3d_calculator:
 
     # ---- depth quality ----
     min_depth_valid_ratio: 0.3
-    depth_roi_ratio: 0.3
+    depth_roi_ratio: 0.15
     depth_outlier_sigma: 2.0
     depth_cluster_tolerance_m: 0.03
     depth_min_cluster_ratio: 0.15
     depth_estimator_mode: "cluster_centroid"
+    depth_hole_fill_enabled: true
+    depth_hole_fill_kernel_size: 3
+    depth_hole_fill_min_neighbors: 4
+    depth_spatial_outlier_threshold_m: 0.05
 
     # ---- coordinate stability ----
-    max_depth_variance_m2: 0.0002
-    coordinate_jump_threshold_m: 0.03
-    stable_window_size: 7
-    coordinate_output_mode: "median"
+    max_depth_variance_m2: 0.0004
+    coordinate_jump_threshold_m: 0.05
+    stable_window_size: 5
 
 # ============================================
 # Estimator Comparison Logger Parameters
@@ -69,10 +72,14 @@ estimator_comparison_logger:
     depth_pixel_offset_y_px: 0.0
     max_depth_m: 10.0
     min_depth_valid_ratio: 0.3
-    depth_roi_ratio: 0.3
+    depth_roi_ratio: 0.15
     depth_outlier_sigma: 2.0
     depth_cluster_tolerance_m: 0.03
     depth_min_cluster_ratio: 0.15
+    depth_hole_fill_enabled: true
+    depth_hole_fill_kernel_size: 3
+    depth_hole_fill_min_neighbors: 4
+    depth_spatial_outlier_threshold_m: 0.05
 
 # ============================================
 # Arm Serial Bridge Parameters
@@ -84,21 +91,21 @@ arm_serial_bridge:
     send_rate: 10.0
     detection_topic: "/detection/detections_3d"
     target_class: ""
-    ema_alpha: 0.20
-    stable_radius_m: 0.015
+    ema_alpha: 0.25
+    stable_radius_m: 0.02
     stable_frames: 3
     max_send_rate: 5.0
     read_feedback: true
-    reach_tolerance_m: 0.015
-    reach_stable_frames: 3
+    reach_tolerance_m: 0.02
+    reach_stable_frames: 2
     arrival_delay_sec: 1.0
     feedback_timeout_sec: 0.5
     detection_timeout_sec: 0.5
     arrival_accept_mcu_reached: true
     arrival_stall_enabled: true
-    arrival_stall_epsilon_m: 0.003
-    arrival_stall_frames: 5
-    arrival_stall_max_distance_m: 0.08
+    arrival_stall_epsilon_m: 0.05
+    arrival_stall_frames: 4
+    arrival_stall_max_distance_m: 0.10
     camera_to_arm_transform_enabled: true
     camera_offset_x_m: 0.105
     camera_offset_y_m: 0.0
@@ -113,5 +120,9 @@ arm_serial_bridge:
 
     # Place target in arm_base frame, meters (÷1000 from MCU mm coords)
     # Flat array: [x1, y1, z1,  x2, y2, z2, ...]
-    place_targets_m: [-0.100, 0.111, 0.420]
+    # Final arm_base coordinates sent to MCU directly; command offsets are not applied.
+    place_targets_m: [-0.2570, -0.1900, 0.3835,
+                      -0.2000,  0.2140, 0.3850,
+                       0.2407,  0.21014, 0.3840,
+                       0.2320, -0.2240, 0.3875]
     place_target_index: 0

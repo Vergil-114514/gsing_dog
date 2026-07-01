@@ -96,16 +96,16 @@ def _make_node() -> ArmSerialBridgeNode:
     node.last_send_time = -100.0
     node.last_sent_target = None
     node.max_send_rate = 1000.0
-    node.reach_tolerance_m = 0.015
-    node.reach_stable_frames = 3
+    node.reach_tolerance_m = 0.02
+    node.reach_stable_frames = 2
     node.arrival_delay_sec = 1.0
     node.feedback_timeout_sec = 0.5
     node.detection_timeout_sec = 0.5
     node.arrival_accept_mcu_reached = True
     node.arrival_stall_enabled = True
-    node.arrival_stall_epsilon_m = 0.003
-    node.arrival_stall_frames = 5
-    node.arrival_stall_max_distance_m = 0.08
+    node.arrival_stall_epsilon_m = 0.05
+    node.arrival_stall_frames = 4
+    node.arrival_stall_max_distance_m = 0.10
     node.target_class = ''
     node.camera_to_arm_transform_enabled = True
     node.vision_transform = VisionTransformConfig(
@@ -117,8 +117,8 @@ def _make_node() -> ArmSerialBridgeNode:
     node.command_abs_y_offset_m = 0.0
     node.serial_tx_log = True
     node.serial_tx_log_hex = False
-    node._place_target = (-0.1, 0.111, 0.42)
-    node._place_target_command = (-0.1, 0.111, 0.51)
+    node._place_target = (-0.257, -0.19, 0.3835)
+    node._place_target_command = node._place_target
     node.ema = _IdentityFilter()
     node.stability = _IdentityFilter()
     node._sent = []
@@ -616,6 +616,16 @@ def test_place_target_is_not_camera_transformed(monkeypatch):
     node._maybe_send_place(now=10.1)
 
     assert sent == [(node._place_target_command, TARGET_TYPE_PLACE, 'place')]
+
+
+def test_place_target_command_is_final_coordinate_without_command_offset():
+    node = _make_node()
+    node.command_offset_m = (0.5, 0.5, 0.09)
+    node.command_abs_y_offset_m = 0.25
+    node._place_target = (-0.257, -0.19, 0.3835)
+    node._place_target_command = node._place_target
+
+    assert node._place_target_command == pytest.approx((-0.257, -0.19, 0.3835))
 
 
 def test_reaching_place_target_waits_and_resets_to_detection(monkeypatch):

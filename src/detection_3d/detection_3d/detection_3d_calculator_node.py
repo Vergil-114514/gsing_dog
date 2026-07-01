@@ -29,6 +29,7 @@ from detection_3d.geometry import (
     project_pixel_to_xyz,
 )
 from detection_3d.depth_processor import (
+    clean_depth_roi,
     compute_roi_size,
     extract_roi,
     estimate_target_point_from_roi,
@@ -68,17 +69,20 @@ class Detection3DCalculatorNode(Node):
 
         # ---- new: depth quality ----
         self.declare_parameter('min_depth_valid_ratio', 0.3)
-        self.declare_parameter('depth_roi_ratio', 0.3)
+        self.declare_parameter('depth_roi_ratio', 0.15)
         self.declare_parameter('depth_outlier_sigma', 2.0)
         self.declare_parameter('depth_cluster_tolerance_m', 0.03)
         self.declare_parameter('depth_min_cluster_ratio', 0.15)
         self.declare_parameter('depth_estimator_mode', 'cluster_centroid')
+        self.declare_parameter('depth_hole_fill_enabled', True)
+        self.declare_parameter('depth_hole_fill_kernel_size', 3)
+        self.declare_parameter('depth_hole_fill_min_neighbors', 4)
+        self.declare_parameter('depth_spatial_outlier_threshold_m', 0.05)
 
         # ---- new: stability ----
-        self.declare_parameter('max_depth_variance_m2', 0.0002)
-        self.declare_parameter('coordinate_jump_threshold_m', 0.03)
-        self.declare_parameter('stable_window_size', 7)
-        self.declare_parameter('coordinate_output_mode', 'median')
+        self.declare_parameter('max_depth_variance_m2', 0.0004)
+        self.declare_parameter('coordinate_jump_threshold_m', 0.05)
+        self.declare_parameter('stable_window_size', 5)
 
         # === resolve ===
 
@@ -113,6 +117,18 @@ class Detection3DCalculatorNode(Node):
         self.depth_min_cluster_ratio = float(
             self.get_parameter('depth_min_cluster_ratio').value
         )
+        self.depth_hole_fill_enabled = bool(
+            self.get_parameter('depth_hole_fill_enabled').value
+        )
+        self.depth_hole_fill_kernel_size = int(
+            self.get_parameter('depth_hole_fill_kernel_size').value
+        )
+        self.depth_hole_fill_min_neighbors = int(
+            self.get_parameter('depth_hole_fill_min_neighbors').value
+        )
+        self.depth_spatial_outlier_threshold_m = float(
+            self.get_parameter('depth_spatial_outlier_threshold_m').value
+        )
         self.depth_estimator_mode = str(
             self.get_parameter('depth_estimator_mode').value
         ).strip().lower()
@@ -126,9 +142,6 @@ class Detection3DCalculatorNode(Node):
         self.max_depth_variance_m2 = float(self.get_parameter('max_depth_variance_m2').value)
         self.jump_threshold_m = float(self.get_parameter('coordinate_jump_threshold_m').value)
         stable_window_size = int(self.get_parameter('stable_window_size').value)
-        coordinate_output_mode = str(
-            self.get_parameter('coordinate_output_mode').value
-        ).strip().lower()
 
         # === camera intrinsics (populated from CameraInfo) ===
         self.fx: float | None = None
@@ -144,7 +157,6 @@ class Detection3DCalculatorNode(Node):
         self._stabilizer = CoordinateStabilizer(
             window_size=stable_window_size,
             max_variance_m2=self.max_depth_variance_m2,
-            output_mode=coordinate_output_mode,
         )
         self._prev_best_pos: tuple[float, float, float] | None = None
         self._prev_best_class: str = ""
@@ -178,9 +190,10 @@ class Detection3DCalculatorNode(Node):
             f'estimator={self.depth_estimator_mode}, '
             f'cluster_tol={self.depth_cluster_tolerance_m}m, '
             f'min_cluster_ratio={self.depth_min_cluster_ratio}, '
+            f'hole_fill={self.depth_hole_fill_enabled}, '
+            f'spatial_outlier={self.depth_spatial_outlier_threshold_m}m, '
             f'valid_ratio>={self.min_depth_valid_ratio}, '
             f'stable_window={stable_window_size}, '
-            f'coord_output={coordinate_output_mode}, '
             f'jump_thresh={self.jump_threshold_m}m, '
             f'source_res={self.source_w}x{self.source_h}, '
             f'depth_pixel_offset=({self.depth_pixel_offset_x_px:.2f}, '
@@ -254,6 +267,14 @@ class Detection3DCalculatorNode(Node):
             roi = extract_roi(depth_image, u, v, roi_size)
             if roi is None:
                 continue
+            roi = clean_depth_roi(
+                roi,
+                depth_scale=self.depth_scale,
+                hole_fill_enabled=self.depth_hole_fill_enabled,
+                hole_fill_kernel_size=self.depth_hole_fill_kernel_size,
+                hole_fill_min_neighbors=self.depth_hole_fill_min_neighbors,
+                spatial_outlier_threshold_m=self.depth_spatial_outlier_threshold_m,
+            )
 
             target_offset_x = 0.0
             target_offset_y = 0.0

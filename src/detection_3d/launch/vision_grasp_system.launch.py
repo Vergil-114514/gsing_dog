@@ -78,6 +78,11 @@ def generate_launch_description():
         'command_abs_y_offset_m', default_value='0.0',
         description='Increase absolute y command magnitude before serial TX',
     )
+    place_target_index_arg = DeclareLaunchArgument(
+        'place_target_index',
+        default_value='0',
+        description='Index of fixed place target: 0=right-rear, 1=left-rear, 2=left-front, 3=right-front',
+    )
 
     camera_launch = IncludeLaunchDescription(
         XMLLaunchDescriptionSource(
@@ -124,6 +129,7 @@ def generate_launch_description():
             'command_offset_y_m': LaunchConfiguration('command_offset_y_m'),
             'command_offset_z_m': LaunchConfiguration('command_offset_z_m'),
             'command_abs_y_offset_m': LaunchConfiguration('command_abs_y_offset_m'),
+            'place_target_index': LaunchConfiguration('place_target_index'),
         }.items(),
     )
 
@@ -143,6 +149,7 @@ def generate_launch_description():
         command_offset_y_arg,
         command_offset_z_arg,
         command_abs_y_offset_arg,
+        place_target_index_arg,
         camera_launch,
         detection_launch,
     ])

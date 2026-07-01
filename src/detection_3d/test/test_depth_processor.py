@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 from detection_3d.depth_processor import (
+    clean_depth_roi,
     compute_roi_size,
     estimate_target_point_from_roi,
     extract_roi,
@@ -16,11 +17,11 @@ from detection_3d.depth_processor import (
 
 class TestComputeRoiSize:
     def test_default_ratio(self):
-        """ROI = 0.3 × smaller box dimension, odd, >= min_size."""
-        size = compute_roi_size(100, 80, roi_ratio=0.3, min_size=5)
+        """ROI = 0.15 × smaller box dimension by default, odd, >= min_size."""
+        size = compute_roi_size(100, 80, min_size=5)
         assert size >= 5
         assert size % 2 == 1
-        assert size == 25  # 80 * 0.3 = 24 → 25 (odd)
+        assert size == 13  # 80 * 0.15 = 12 → 13 (odd)
 
     def test_clamps_to_min(self):
         """Tiny boxes get min_size at minimum."""
@@ -75,6 +76,126 @@ class TestExtractRoi:
         roi = extract_roi(img, 5, 5, 99)
         assert roi is not None
         assert roi.shape == (10, 10)
+
+
+# ---------------------------------------------------------------------------
+# clean_depth_roi
+# ---------------------------------------------------------------------------
+
+class TestCleanDepthRoi:
+    def test_fills_zero_hole_when_neighbors_are_valid(self):
+        """Small zero holes are filled from the local median."""
+        roi = np.full((3, 3), 1000, dtype=np.uint16)
+        roi[1, 1] = 0
+
+        cleaned = clean_depth_roi(
+            roi,
+            depth_scale=0.001,
+            hole_fill_enabled=True,
+            hole_fill_kernel_size=3,
+            hole_fill_min_neighbors=4,
+            spatial_outlier_threshold_m=0.05,
+        )
+
+        assert cleaned[1, 1] == 1000
+        assert roi[1, 1] == 0
+
+    def test_does_not_fill_hole_with_too_few_neighbors(self):
+        """Sparse neighborhoods are left unchanged instead of guessed."""
+        roi = np.zeros((3, 3), dtype=np.uint16)
+        roi[0, 0] = 1000
+        roi[0, 1] = 1000
+        roi[1, 0] = 1000
+
+        cleaned = clean_depth_roi(
+            roi,
+            depth_scale=0.001,
+            hole_fill_enabled=True,
+            hole_fill_kernel_size=3,
+            hole_fill_min_neighbors=4,
+            spatial_outlier_threshold_m=0.05,
+        )
+
+        assert cleaned[1, 1] == 0
+
+    def test_removes_isolated_spatial_outlier(self):
+        """Depth spikes far from their local median are invalidated."""
+        roi = np.full((3, 3), 1000, dtype=np.uint16)
+        roi[1, 1] = 1300
+
+        cleaned = clean_depth_roi(
+            roi,
+            depth_scale=0.001,
+            hole_fill_enabled=True,
+            hole_fill_kernel_size=3,
+            hole_fill_min_neighbors=4,
+            spatial_outlier_threshold_m=0.05,
+        )
+
+        assert cleaned[1, 1] == 0
+
+    def test_preserves_connected_foreground_against_background(self):
+        """Foreground edges are not removed just because background is nearby."""
+        roi = np.full((7, 7), 3000, dtype=np.uint16)
+        roi[1:4, 1:4] = 1000
+
+        cleaned = clean_depth_roi(
+            roi,
+            depth_scale=0.001,
+            hole_fill_enabled=True,
+            hole_fill_kernel_size=3,
+            hole_fill_min_neighbors=4,
+            spatial_outlier_threshold_m=0.05,
+        )
+        estimate = estimate_target_point_from_roi(
+            cleaned,
+            depth_scale=0.001,
+            min_valid_ratio=0.3,
+            cluster_tolerance_m=0.03,
+            min_cluster_ratio=0.15,
+        )
+
+        assert estimate is not None
+        assert estimate.depth_m == pytest.approx(1.0)
+
+    def test_hole_fill_can_be_disabled(self):
+        """Disabling hole fill keeps holes while still allowing outlier removal."""
+        roi = np.full((3, 3), 1000, dtype=np.uint16)
+        roi[1, 1] = 0
+
+        cleaned = clean_depth_roi(
+            roi,
+            depth_scale=0.001,
+            hole_fill_enabled=False,
+            hole_fill_kernel_size=3,
+            hole_fill_min_neighbors=4,
+            spatial_outlier_threshold_m=0.05,
+        )
+
+        assert cleaned[1, 1] == 0
+
+    def test_cleaned_roi_recovers_center_hole_for_estimator(self):
+        """Cleaning restores enough center depth for target estimation."""
+        roi = np.full((5, 5), 900, dtype=np.uint16)
+        roi[2, 2] = 0
+
+        cleaned = clean_depth_roi(
+            roi,
+            depth_scale=0.001,
+            hole_fill_enabled=True,
+            hole_fill_kernel_size=3,
+            hole_fill_min_neighbors=4,
+            spatial_outlier_threshold_m=0.05,
+        )
+        estimate = estimate_target_point_from_roi(
+            cleaned,
+            depth_scale=0.001,
+            min_valid_ratio=0.3,
+        )
+
+        assert cleaned[2, 2] == 900
+        assert estimate is not None
+        assert estimate.depth_m == pytest.approx(0.9)
 
 
 # ---------------------------------------------------------------------------

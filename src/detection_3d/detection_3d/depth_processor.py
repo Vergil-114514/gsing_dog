@@ -30,7 +30,7 @@ class DepthEstimate:
 def compute_roi_size(
     box_w_px: float,
     box_h_px: float,
-    roi_ratio: float = 0.3,
+    roi_ratio: float = 0.15,
     min_size: int = 5,
 ) -> int:
     """
@@ -82,6 +82,89 @@ def extract_roi(
     if x2 <= x1 or y2 <= y1:
         return None
     return depth_image[y1:y2, x1:x2]
+
+
+def _normalize_kernel_size(kernel_size: int) -> int:
+    size = max(3, int(kernel_size))
+    if size % 2 == 0:
+        size += 1
+    return size
+
+
+def _assign_depth_value(target: np.ndarray, y: int, x: int, value: float) -> None:
+    if np.issubdtype(target.dtype, np.integer):
+        info = np.iinfo(target.dtype)
+        value = float(np.clip(round(value), info.min, info.max))
+    target[y, x] = value
+
+
+def clean_depth_roi(
+    roi: np.ndarray,
+    depth_scale: float = 0.001,
+    hole_fill_enabled: bool = True,
+    hole_fill_kernel_size: int = 3,
+    hole_fill_min_neighbors: int = 4,
+    spatial_outlier_threshold_m: float = 0.05,
+) -> np.ndarray:
+    """
+    Clean a small depth ROI before estimating the target point.
+
+    The filter is intentionally local to the ROI: it fills small Astra depth
+    holes from nearby valid pixels and removes isolated depth spikes before
+    they can become a wrong 3D target.
+    """
+    if roi.size == 0:
+        return roi.copy()
+
+    cleaned = roi.copy()
+    kernel_size = _normalize_kernel_size(hole_fill_kernel_size)
+    half = kernel_size // 2
+    min_neighbors = max(1, int(hole_fill_min_neighbors))
+    threshold_raw = float(spatial_outlier_threshold_m) / max(float(depth_scale), 1e-12)
+    h, w = cleaned.shape[:2]
+
+    if hole_fill_enabled:
+        source = cleaned.copy()
+        for y in range(h):
+            for x in range(w):
+                if source[y, x] != 0:
+                    continue
+
+                y1 = max(0, y - half)
+                y2 = min(h, y + half + 1)
+                x1 = max(0, x - half)
+                x2 = min(w, x + half + 1)
+                neighbors = source[y1:y2, x1:x2]
+                valid = neighbors[neighbors > 0]
+                if len(valid) >= min_neighbors:
+                    _assign_depth_value(cleaned, y, x, float(np.median(valid)))
+
+    if spatial_outlier_threshold_m <= 0.0:
+        return cleaned
+
+    source = cleaned.copy()
+    for y in range(h):
+        for x in range(w):
+            value = float(source[y, x])
+            if value <= 0.0:
+                continue
+
+            y1 = max(0, y - half)
+            y2 = min(h, y + half + 1)
+            x1 = max(0, x - half)
+            x2 = min(w, x + half + 1)
+            neighbors = source[y1:y2, x1:x2].astype(np.float64)
+            valid_mask = neighbors > 0.0
+            valid_mask[y - y1, x - x1] = False
+            valid = neighbors[valid_mask]
+            if len(valid) < min_neighbors:
+                continue
+
+            same_depth_neighbors = valid[np.abs(valid - value) <= threshold_raw]
+            if len(same_depth_neighbors) < 1:
+                cleaned[y, x] = 0
+
+    return cleaned
 
 
 def filter_depth_roi(

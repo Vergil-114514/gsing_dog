@@ -116,6 +116,10 @@ def generate_launch_description():
         'command_abs_y_offset_m', default_value='0.0',
         description='Increase absolute y command magnitude before serial TX',
     )
+    place_target_index_arg = DeclareLaunchArgument(
+        'place_target_index', default_value='0',
+        description='Index of fixed place target: 0=right-rear, 1=left-rear, 2=left-front, 3=right-front',
+    )
 
     # ---- Detection nodes ----
     yolo_node = Node(
@@ -160,6 +164,7 @@ def generate_launch_description():
             'command_offset_y_m': LaunchConfiguration('command_offset_y_m'),
             'command_offset_z_m': LaunchConfiguration('command_offset_z_m'),
             'command_abs_y_offset_m': LaunchConfiguration('command_abs_y_offset_m'),
+            'place_target_index': LaunchConfiguration('place_target_index'),
         }],
         output='screen',
         condition=IfCondition(LaunchConfiguration('use_arm_bridge')),
@@ -234,6 +239,7 @@ def generate_launch_description():
         command_offset_y_arg,
         command_offset_z_arg,
         command_abs_y_offset_arg,
+        place_target_index_arg,
         yolo_node,
         calc_node,
         arm_bridge_node,

@@ -11,6 +11,7 @@ from sensor_msgs.msg import CameraInfo, Image
 from vision_msgs.msg import Detection2DArray
 
 from detection_3d.depth_processor import (
+    clean_depth_roi,
     compute_roi_size,
     estimate_target_point_from_roi,
     extract_roi,
@@ -45,10 +46,14 @@ class EstimatorComparisonLoggerNode(Node):
         self.declare_parameter('depth_pixel_offset_y_px', 0.0)
         self.declare_parameter('max_depth_m', 10.0)
         self.declare_parameter('min_depth_valid_ratio', 0.3)
-        self.declare_parameter('depth_roi_ratio', 0.3)
+        self.declare_parameter('depth_roi_ratio', 0.15)
         self.declare_parameter('depth_outlier_sigma', 2.0)
         self.declare_parameter('depth_cluster_tolerance_m', 0.03)
         self.declare_parameter('depth_min_cluster_ratio', 0.15)
+        self.declare_parameter('depth_hole_fill_enabled', True)
+        self.declare_parameter('depth_hole_fill_kernel_size', 3)
+        self.declare_parameter('depth_hole_fill_min_neighbors', 4)
+        self.declare_parameter('depth_spatial_outlier_threshold_m', 0.05)
 
         output_path = Path(self.get_parameter('output_path').value)
         append = bool(self.get_parameter('append').value)
@@ -76,6 +81,18 @@ class EstimatorComparisonLoggerNode(Node):
         )
         self.depth_min_cluster_ratio = float(
             self.get_parameter('depth_min_cluster_ratio').value
+        )
+        self.depth_hole_fill_enabled = bool(
+            self.get_parameter('depth_hole_fill_enabled').value
+        )
+        self.depth_hole_fill_kernel_size = int(
+            self.get_parameter('depth_hole_fill_kernel_size').value
+        )
+        self.depth_hole_fill_min_neighbors = int(
+            self.get_parameter('depth_hole_fill_min_neighbors').value
+        )
+        self.depth_spatial_outlier_threshold_m = float(
+            self.get_parameter('depth_spatial_outlier_threshold_m').value
         )
 
         self.fx: float | None = None
@@ -197,6 +214,14 @@ class EstimatorComparisonLoggerNode(Node):
             roi = extract_roi(depth_image, u, v, roi_size)
             if roi is None:
                 continue
+            roi = clean_depth_roi(
+                roi,
+                depth_scale=self.depth_scale,
+                hole_fill_enabled=self.depth_hole_fill_enabled,
+                hole_fill_kernel_size=self.depth_hole_fill_kernel_size,
+                hole_fill_min_neighbors=self.depth_hole_fill_min_neighbors,
+                spatial_outlier_threshold_m=self.depth_spatial_outlier_threshold_m,
+            )
 
             baseline_depth_m, baseline_quality = filter_depth_roi(
                 roi,

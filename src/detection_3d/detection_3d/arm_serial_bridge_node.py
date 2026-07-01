@@ -192,16 +192,16 @@ class ArmSerialBridgeNode(Node):
         self.declare_parameter('read_feedback', True)
 
         # ---- host state-machine timing ----
-        self.declare_parameter('reach_tolerance_m', 0.015)
-        self.declare_parameter('reach_stable_frames', 3)
+        self.declare_parameter('reach_tolerance_m', 0.02)
+        self.declare_parameter('reach_stable_frames', 2)
         self.declare_parameter('arrival_delay_sec', 1.0)
         self.declare_parameter('feedback_timeout_sec', 0.5)
         self.declare_parameter('detection_timeout_sec', 0.5)
         self.declare_parameter('arrival_accept_mcu_reached', True)
         self.declare_parameter('arrival_stall_enabled', True)
-        self.declare_parameter('arrival_stall_epsilon_m', 0.003)
-        self.declare_parameter('arrival_stall_frames', 5)
-        self.declare_parameter('arrival_stall_max_distance_m', 0.08)
+        self.declare_parameter('arrival_stall_epsilon_m', 0.05)
+        self.declare_parameter('arrival_stall_frames', 4)
+        self.declare_parameter('arrival_stall_max_distance_m', 0.10)
 
         # ---- vision camera -> arm base transform ----
         self.declare_parameter('camera_to_arm_transform_enabled', True)
@@ -306,7 +306,7 @@ class ArmSerialBridgeNode(Node):
         # === place targets ===
         place_targets = validate_place_targets(place_targets_m_raw)
         self._place_target = get_place_target(place_targets, place_target_index)
-        self._place_target_command = self._apply_command_offset(self._place_target)
+        self._place_target_command = self._place_target
 
         # === host-driven state ===
         self._bridge_state = BridgeState.WAIT_DETECTION
