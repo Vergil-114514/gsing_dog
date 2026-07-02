@@ -120,8 +120,8 @@ arm_serial_bridge:
     camera_tilt_forward_deg: 45.0
     command_offset_x_m: 0.0
     command_offset_y_m: 0.0
-    command_offset_z_m: 0.15
-    command_abs_y_offset_m: -0.01
+    command_offset_z_m: 0.11
+    command_abs_y_offset_m: 0.03
     serial_tx_log: true
     serial_tx_log_hex: false
     serial_rx_log: true
@@ -129,9 +129,10 @@ arm_serial_bridge:
 
     # Place target in arm_base frame, meters (÷1000 from MCU mm coords)
     # Flat array: [x1, y1, z1,  x2, y2, z2, ...]
+    # Index 0=right_rear, 1=left_rear, 2=left_front, 3=right_front
     # Final arm_base coordinates sent to MCU directly; command offsets are not applied.
-    place_targets_m: [-0.2470, -0.2000, 0.3835,
-                      -0.2000,  0.2140, 0.3850,
+    place_targets_m: [-0.2170, -0.2200, 0.3835,
+                      -0.2170,  0.2200, 0.3835,
                        0.2407,  0.21014, 0.3840,
-                       0.2320, -0.2240, 0.3875]
+                       0.2170, -0.2200, 0.3835]
     place_target_index: 0

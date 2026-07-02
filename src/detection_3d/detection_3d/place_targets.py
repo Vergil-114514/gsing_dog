@@ -3,6 +3,14 @@
 The array format is: [x1, y1, z1, x2, y2, z2, ...]  (unit: m).
 """
 
+# Human-readable names for place target indices (used in logs).
+PLACE_TARGET_NAMES: dict[int, str] = {
+    0: "right_rear",
+    1: "left_rear",
+    2: "left_front",
+    3: "right_front",
+}
+
 
 def validate_place_targets(arr: list[float]) -> list[tuple[float, float, float]]:
     if len(arr) % 3 != 0:

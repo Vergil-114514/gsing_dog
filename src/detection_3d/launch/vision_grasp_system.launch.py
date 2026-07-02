@@ -79,11 +79,11 @@ def generate_launch_description():
         description='Final y command offset applied before serial TX',
     )
     command_offset_z_arg = DeclareLaunchArgument(
-        'command_offset_z_m', default_value='0.15',
+        'command_offset_z_m', default_value='0.11',
         description='Final z command offset applied before serial TX',
     )
     command_abs_y_offset_arg = DeclareLaunchArgument(
-        'command_abs_y_offset_m', default_value='-0.01',
+        'command_abs_y_offset_m', default_value='0.03',
         description='Adjust absolute y command magnitude before serial TX; negative shrinks toward zero',
     )
     place_target_index_arg = DeclareLaunchArgument(
