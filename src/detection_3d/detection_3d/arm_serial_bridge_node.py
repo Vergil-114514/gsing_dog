@@ -32,7 +32,11 @@ try:
 except ImportError:  # pragma: no cover - unit tests without ROS2 messages
     Detection3DArray = object  # type: ignore[assignment]
 
-from detection_3d.place_targets import validate_place_targets, get_place_target
+from detection_3d.place_targets import (
+    PLACE_TARGET_NAMES,
+    get_place_target,
+    validate_place_targets,
+)
 from detection_3d.protocol import (
     ARM_STATE_REACHED,
     FUNC_ARM_FEEDBACK,
@@ -217,8 +221,8 @@ class ArmSerialBridgeNode(Node):
         self.declare_parameter('camera_tilt_forward_deg', 45.0)
         self.declare_parameter('command_offset_x_m', 0.0)
         self.declare_parameter('command_offset_y_m', 0.0)
-        self.declare_parameter('command_offset_z_m', 0.15)
-        self.declare_parameter('command_abs_y_offset_m', -0.01)
+        self.declare_parameter('command_offset_z_m', 0.11)
+        self.declare_parameter('command_abs_y_offset_m', 0.03)
         self.declare_parameter('serial_tx_log', True)
         self.declare_parameter('serial_tx_log_hex', False)
         self.declare_parameter('serial_rx_log', True)
@@ -335,9 +339,14 @@ class ArmSerialBridgeNode(Node):
         )
 
         # === place targets ===
-        place_targets = validate_place_targets(place_targets_m_raw)
-        self._place_target = get_place_target(place_targets, place_target_index)
+        self._place_targets = validate_place_targets(place_targets_m_raw)
+        self._place_target_index = place_target_index
+        self._place_target = get_place_target(
+            self._place_targets, self._place_target_index
+        )
         self._place_target_command = self._place_target
+        self._locked_place_target: tuple[float, float, float] | None = None
+        self._locked_place_index: int | None = None
 
         # === host-driven state ===
         self._bridge_state = BridgeState.WAIT_DETECTION
@@ -405,10 +414,13 @@ class ArmSerialBridgeNode(Node):
             f'{self.command_offset_m[1]:.3f}, '
             f'{self.command_offset_m[2]:.3f})m, '
             f'command_abs_y_offset={self.command_abs_y_offset_m:.3f}m, '
-            f'place=({self._place_target[0]:.3f}, '
-            f'{self._place_target[1]:.3f}, '
-            f'{self._place_target[2]:.3f})m'
+            f'place_target_index={self._place_target_index}'
         )
+        for i, t in enumerate(self._place_targets):
+            name = PLACE_TARGET_NAMES.get(i, f'idx_{i}')
+            self.get_logger().info(
+                f'  place[{i}] {name}: ({t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f})m'
+            )
 
     # ------------------------------------------------------------------
     # Serial helpers
@@ -687,7 +699,7 @@ class ArmSerialBridgeNode(Node):
             )
 
     def _maybe_send_place(self, now: float):
-        target = self._place_target_command
+        target = self._active_place_target
         sent = self._send_target_immediate(
             target, target_type=TARGET_TYPE_PLACE, tag='place', now=now
         )
@@ -710,7 +722,7 @@ class ArmSerialBridgeNode(Node):
         target = self._hold_target
         if target is None:
             target = (
-                self._place_target_command
+                self._active_place_target
                 if target_type == TARGET_TYPE_PLACE
                 else self._active_target
             )
@@ -744,7 +756,7 @@ class ArmSerialBridgeNode(Node):
 
     def _send_place_delay_then_pump_off(self, now: float) -> None:
         """Keep the placed block stable before releasing the pump."""
-        target = self._hold_target or self._place_target_command
+        target = self._hold_target or self._active_place_target
         sent = self._send_target_immediate(
             target,
             target_type=TARGET_TYPE_PLACE,
@@ -1017,6 +1029,11 @@ class ArmSerialBridgeNode(Node):
             f'SERIAL_TX 0x12 ARM_TARGET target={tag} type={target_type} '
             f'x={target[0]:.6f} y={target[1]:.6f} z={target[2]:.6f}'
         )
+        if target_type == TARGET_TYPE_PLACE and self._locked_place_index is not None:
+            name = PLACE_TARGET_NAMES.get(
+                self._locked_place_index, f'idx_{self._locked_place_index}'
+            )
+            msg = f'{msg} place=[{self._locked_place_index}] {name}'
         if self.serial_tx_log_hex:
             msg = f'{msg} frame={frame.hex(" ")}'
         self.get_logger().info(msg)
@@ -1056,12 +1073,68 @@ class ArmSerialBridgeNode(Node):
             msg = f'{msg} frame={frame.hex(" ")}'
         self.get_logger().info(msg)
 
+    @property
+    def _active_place_target(self) -> tuple[float, float, float]:
+        """Return the currently active place target (locked or fallback)."""
+        if self._locked_place_target is not None:
+            return self._locked_place_target
+        return self._place_target_command
+
+    def _lock_place_target(self) -> None:
+        """Lock place target based on end_y at grasp arrival moment.
+
+        end_y < 0  → right_front  (index 3)
+        end_y > 0  → left_rear   (index 1)
+        end_y == 0 → use configured place_target_index as fallback
+        """
+        if self._latest_feedback is None:
+            self.get_logger().warn(
+                'Cannot lock place target: no MCU feedback available; '
+                'falling back to place_target_index'
+            )
+            return
+
+        end_y = self._latest_feedback.end_xyz_m[1]
+
+        if len(self._place_targets) >= 4:
+            if end_y < 0:
+                idx = 3  # right_front
+            elif end_y > 0:
+                idx = 1  # left_rear
+            else:
+                idx = self._place_target_index
+        else:
+            idx = self._place_target_index
+            self.get_logger().warn(
+                f'place_targets_m has only {len(self._place_targets)} '
+                f'target(s); dynamic selection disabled, '
+                f'using place_target_index={idx}'
+            )
+
+        name = PLACE_TARGET_NAMES.get(idx, f'idx_{idx}')
+        self._locked_place_target = self._place_targets[idx]
+        self._locked_place_index = idx
+        self.get_logger().info(
+            f'Locked place target [{idx}] {name}: '
+            f'({self._locked_place_target[0]:.4f}, '
+            f'{self._locked_place_target[1]:.4f}, '
+            f'{self._locked_place_target[2]:.4f}) '
+            f'(end_y={end_y:.4f})'
+        )
+
     def _set_state(self, state: BridgeState):
         if self._bridge_state == state:
             return
         prev = self._bridge_state
         self._bridge_state = state
         self._state_enter_time = time.monotonic()
+
+        if state == BridgeState.GRASP_DELAY:
+            self._lock_place_target()
+        elif state == BridgeState.WAIT_DETECTION:
+            self._locked_place_target = None
+            self._locked_place_index = None
+
         self.get_logger().info(f'Arm bridge state: {prev.value} -> {state.value}')
 
     def _drop_grasp_detection(self, reason: str):

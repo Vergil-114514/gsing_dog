@@ -128,14 +128,23 @@ def _make_node() -> ArmSerialBridgeNode:
         camera_offset_y_m=0.0,
         camera_offset_z_m=-0.078,
     )
-    node.command_offset_m = (0.0, 0.0, 0.15)
-    node.command_abs_y_offset_m = -0.01
+    node.command_offset_m = (0.0, 0.0, 0.11)
+    node.command_abs_y_offset_m = 0.03
     node.serial_tx_log = True
     node.serial_tx_log_hex = False
     node.serial_rx_log = True
     node.serial_rx_log_hex = True
-    node._place_target = (-0.247, -0.2, 0.3835)
+    node._place_targets = [
+        (-0.217, -0.22, 0.3835),   # 0: right_rear
+        (-0.217, 0.22, 0.3835),    # 1: left_rear
+        (0.2407, 0.21014, 0.384),  # 2: left_front
+        (0.217, -0.22, 0.3835),    # 3: right_front
+    ]
+    node._place_target_index = 0
+    node._place_target = node._place_targets[0]
     node._place_target_command = node._place_target
+    node._locked_place_target = None
+    node._locked_place_index = None
     node.ema = _IdentityFilter()
     node.stability = _IdentityFilter()
     node._sent = []
@@ -217,7 +226,7 @@ def test_grasp_send_uses_latest_feedback_transform(monkeypatch):
     node._maybe_send_grasp(now=10.1)
 
     assert len(sent) == 1
-    assert sent[0][0] == pytest.approx((0.425208153, -0.08, 0.280076118))
+    assert sent[0][0] == pytest.approx((0.425208153, -0.12, 0.240076118))
     assert sent[0][1] == TARGET_TYPE_GRASP
     assert sent[0][2] == 'grasp'
 
@@ -437,7 +446,7 @@ def test_reaching_grasp_target_enters_delay_then_place(monkeypatch):
     node._maybe_send_grasp(now=10.0)
 
     assert len(sent) == 1
-    assert sent[0][0] == pytest.approx((0.2, -0.09, 0.45))
+    assert sent[0][0] == pytest.approx((0.2, -0.13, 0.41))
     assert sent[0][1:] == (TARGET_TYPE_GRASP, 'grasp')
 
     node._latest_feedback = ArmFeedback(
@@ -984,10 +993,10 @@ def test_place_target_command_is_final_coordinate_without_command_offset():
     node = _make_node()
     node.command_offset_m = (0.5, 0.5, 0.23)
     node.command_abs_y_offset_m = 0.25
-    node._place_target = (-0.247, -0.2, 0.3835)
+    node._place_target = (-0.217, -0.22, 0.3835)
     node._place_target_command = node._place_target
 
-    assert node._place_target_command == pytest.approx((-0.247, -0.2, 0.3835))
+    assert node._place_target_command == pytest.approx((-0.217, -0.22, 0.3835))
 
 
 def test_reaching_place_target_waits_and_resets_to_detection(monkeypatch):
@@ -1194,3 +1203,270 @@ def test_arm_state_error_does_not_stop_host_state_machine(monkeypatch):
 
     assert node._bridge_state == BridgeState.SEND_PLACE
     assert len(sent) == 1
+
+
+# ---------------------------------------------------------------------------
+# Dynamic place target selection tests
+# ---------------------------------------------------------------------------
+
+
+def test_grasp_arrival_locks_right_front_when_end_y_negative(monkeypatch):
+    """end_y < 0 at grasp arrival → place target locked to right_front (idx 3)."""
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.2, -0.15, 0.3),  # end_y < 0
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+
+    node._set_state(BridgeState.GRASP_DELAY)
+
+    assert node._locked_place_target == pytest.approx((0.217, -0.22, 0.3835))
+    assert node._locked_place_index == 3
+
+    sent = []
+    monkeypatch.setattr(
+        node,
+        '_send_target_immediate',
+        lambda target, target_type, tag, now=None: sent.append(
+            (target, target_type, tag)
+        ) or True,
+    )
+
+    node._maybe_send_place(now=10.1)
+
+    assert len(sent) == 1
+    assert sent[0][0] == pytest.approx((0.217, -0.22, 0.3835))
+    assert sent[0][1] == TARGET_TYPE_PLACE
+
+
+def test_grasp_arrival_locks_left_rear_when_end_y_positive(monkeypatch):
+    """end_y > 0 at grasp arrival → place target locked to left_rear (idx 1)."""
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.2, 0.15, 0.3),  # end_y > 0
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+
+    node._set_state(BridgeState.GRASP_DELAY)
+
+    assert node._locked_place_target == pytest.approx((-0.217, 0.22, 0.3835))
+    assert node._locked_place_index == 1
+
+    sent = []
+    monkeypatch.setattr(
+        node,
+        '_send_target_immediate',
+        lambda target, target_type, tag, now=None: sent.append(
+            (target, target_type, tag)
+        ) or True,
+    )
+
+    node._maybe_send_place(now=10.1)
+
+    assert len(sent) == 1
+    assert sent[0][0] == pytest.approx((-0.217, 0.22, 0.3835))
+    assert sent[0][1] == TARGET_TYPE_PLACE
+
+
+def test_grasp_arrival_uses_place_target_index_when_end_y_zero(monkeypatch):
+    """end_y == 0 → fallback to place_target_index target (idx 0 = right_rear)."""
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.2, 0.0, 0.3),  # end_y == 0
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+
+    node._set_state(BridgeState.GRASP_DELAY)
+
+    assert node._locked_place_target == pytest.approx((-0.217, -0.22, 0.3835))
+    assert node._locked_place_index == 0
+
+    sent = []
+    monkeypatch.setattr(
+        node,
+        '_send_target_immediate',
+        lambda target, target_type, tag, now=None: sent.append(
+            (target, target_type, tag)
+        ) or True,
+    )
+
+    node._maybe_send_place(now=10.1)
+
+    assert len(sent) == 1
+    assert sent[0][0] == pytest.approx((-0.217, -0.22, 0.3835))
+
+
+def test_locked_place_target_unchanged_by_subsequent_feedback(monkeypatch):
+    """Once locked on GRASP_DELAY, feedback y changes do not switch the target."""
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.2, -0.15, 0.3),  # end_y < 0 → right_front
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+
+    node._set_state(BridgeState.GRASP_DELAY)
+
+    locked_before = node._locked_place_target
+    assert locked_before == pytest.approx((0.217, -0.22, 0.3835))
+
+    # Simulate feedback y flipping positive mid-flight
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.3, 0.2, 0.35),  # end_y > 0 now
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.5
+
+    locked_after = node._locked_place_target
+    assert locked_after == locked_before
+
+    sent = []
+    monkeypatch.setattr(
+        node,
+        '_send_target_immediate',
+        lambda target, target_type, tag, now=None: sent.append(
+            (target, target_type, tag)
+        ) or True,
+    )
+
+    node._maybe_send_place(now=10.6)
+
+    assert sent[0][0] == pytest.approx((0.217, -0.22, 0.3835))
+
+
+def test_place_target_locked_cleared_on_wait_detection():
+    """Locked target is cleared when state resets to WAIT_DETECTION."""
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.2, -0.15, 0.3),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+
+    node._set_state(BridgeState.GRASP_DELAY)
+
+    assert node._locked_place_target is not None
+    assert node._locked_place_index is not None
+
+    node._set_state(BridgeState.SEND_PLACE)
+    assert node._locked_place_target is not None  # persists through SEND_PLACE
+
+    node._set_state(BridgeState.PLACE_DELAY)
+    assert node._locked_place_target is not None  # persists through PLACE_DELAY
+
+    node._set_state(BridgeState.WAIT_DETECTION)
+    assert node._locked_place_target is None
+    assert node._locked_place_index is None
+
+
+def test_place_target_falls_back_when_feedback_is_none(monkeypatch):
+    """If _latest_feedback is None at lock time, fallback to place_target_index."""
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_feedback = None
+
+    node._set_state(BridgeState.GRASP_DELAY)
+
+    # Should keep fallback (idx 0)
+    assert node._locked_place_target is None
+    assert node._locked_place_index is None
+
+    sent = []
+    monkeypatch.setattr(
+        node,
+        '_send_target_immediate',
+        lambda target, target_type, tag, now=None: sent.append(
+            (target, target_type, tag)
+        ) or True,
+    )
+
+    node._maybe_send_place(now=10.1)
+
+    assert sent[0][0] == pytest.approx((-0.217, -0.22, 0.3835))
+
+
+def test_place_target_fewer_than_four_uses_place_target_index(monkeypatch):
+    """When place_targets has <4 entries, dynamic selection is disabled."""
+    node = _make_node()
+    node._place_targets = [(-0.3, -0.3, 0.3), (-0.2, 0.2, 0.35)]
+    node._place_target_index = 0
+    node._place_target = node._place_targets[0]
+    node._place_target_command = node._place_target
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.2, -0.15, 0.3),  # end_y < 0
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+
+    node._set_state(BridgeState.GRASP_DELAY)
+
+    # Should lock to idx 0 despite end_y < 0, because < 4 targets
+    assert node._locked_place_target == pytest.approx((-0.3, -0.3, 0.3))
+    assert node._locked_place_index == 0
+    assert ('warn', "place_targets_m has only 2 target(s); dynamic selection disabled, using place_target_index=0") in node._logger.messages
+
+
+def test_place_coordinate_not_camera_transformed_with_dynamic_target(monkeypatch):
+    """Place target (even dynamically selected) is NOT camera-transformed."""
+    node = _make_node()
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.2, -0.15, 0.3),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+
+    node._set_state(BridgeState.GRASP_DELAY)
+
+    # Explicitly test that the locked target is the raw coordinate,
+    # not transformed by any camera feedback
+    assert node._locked_place_target == pytest.approx((0.217, -0.22, 0.3835))
+
+
+def test_place_coordinate_no_command_offset_with_dynamic_target(monkeypatch):
+    """Dynamic place target does not get command offsets applied."""
+    node = _make_node()
+    node.command_offset_m = (0.5, 0.5, 0.23)
+    node.command_abs_y_offset_m = 0.25
+    node._bridge_state = BridgeState.SEND_GRASP
+    node._latest_feedback = ArmFeedback(
+        arm_state=ARM_STATE_MOVING,
+        end_xyz_m=(0.2, -0.15, 0.3),
+        theta1_rad=0.0,
+    )
+    node._last_feedback_time = 10.0
+
+    node._set_state(BridgeState.GRASP_DELAY)
+
+    # Locked target must be the raw coordinate, no offset applied
+    assert node._locked_place_target == pytest.approx((0.217, -0.22, 0.3835))
+
+    sent = []
+    monkeypatch.setattr(
+        node,
+        '_send_target_immediate',
+        lambda target, target_type, tag, now=None: sent.append(
+            (target, target_type, tag)
+        ) or True,
+    )
+
+    node._maybe_send_place(now=10.1)
+
+    assert sent[0][0] == pytest.approx((0.217, -0.22, 0.3835))
