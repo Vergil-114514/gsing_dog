@@ -96,6 +96,14 @@ def generate_launch_description():
         'serial_tx_log_hex', default_value='false',
         description='Print complete serial TX frame bytes in hex',
     )
+    serial_rx_log_arg = DeclareLaunchArgument(
+        'serial_rx_log', default_value='true',
+        description='Print parsed MCU feedback frames received from CDC',
+    )
+    serial_rx_log_hex_arg = DeclareLaunchArgument(
+        'serial_rx_log_hex', default_value='true',
+        description='Print complete serial RX frame bytes in hex',
+    )
     camera_tilt_forward_arg = DeclareLaunchArgument(
         'camera_tilt_forward_deg', default_value='45.0',
         description='Camera optical axis tilt from vertical down toward arm +x_e',
@@ -109,11 +117,11 @@ def generate_launch_description():
         description='Final y command offset applied before serial TX',
     )
     command_offset_z_arg = DeclareLaunchArgument(
-        'command_offset_z_m', default_value='0.23',
+        'command_offset_z_m', default_value='0.15',
         description='Final z command offset applied before serial TX',
     )
     command_abs_y_offset_arg = DeclareLaunchArgument(
-        'command_abs_y_offset_m', default_value='0.0',
+        'command_abs_y_offset_m', default_value='-0.01',
         description='Adjust absolute y command magnitude before serial TX; negative shrinks toward zero',
     )
     place_target_index_arg = DeclareLaunchArgument(
@@ -129,8 +137,44 @@ def generate_launch_description():
         description='Recent successful grasp commands used for occlusion median',
     )
     grasp_occlusion_timeout_arg = DeclareLaunchArgument(
-        'grasp_occlusion_timeout_sec', default_value='3.0',
+        'grasp_occlusion_timeout_sec', default_value='8.0',
         description='Maximum seconds to hold grasp target after vision timeout',
+    )
+    arrival_stall_enabled_arg = DeclareLaunchArgument(
+        'arrival_stall_enabled', default_value='true',
+        description='Treat near-target stopped end-effector as arrival',
+    )
+    arrival_stall_epsilon_arg = DeclareLaunchArgument(
+        'arrival_stall_epsilon_m', default_value='0.015',
+        description='Maximum per-frame end-effector motion for stall arrival',
+    )
+    arrival_stall_frames_arg = DeclareLaunchArgument(
+        'arrival_stall_frames', default_value='5',
+        description='Consecutive stall frames required for arrival',
+    )
+    arrival_stall_max_distance_arg = DeclareLaunchArgument(
+        'arrival_stall_max_distance_m', default_value='0.08',
+        description='Maximum target distance accepted for stall arrival',
+    )
+    feedback_loss_abort_arg = DeclareLaunchArgument(
+        'feedback_loss_abort_sec', default_value='3.0',
+        description='Reset state and request pump off after this long without MCU feedback',
+    )
+    mcu_reached_enabled_arg = DeclareLaunchArgument(
+        'mcu_reached_enabled', default_value='true',
+        description='Allow constrained MCU reached state as one arrival condition',
+    )
+    mcu_reached_stable_frames_arg = DeclareLaunchArgument(
+        'mcu_reached_stable_frames', default_value='2',
+        description='Consecutive MCU reached feedback frames required for arrival',
+    )
+    mcu_reached_max_distance_arg = DeclareLaunchArgument(
+        'mcu_reached_max_distance_m', default_value='0.10',
+        description='Maximum end-target distance accepted for MCU reached arrival',
+    )
+    mcu_reached_min_motion_arg = DeclareLaunchArgument(
+        'mcu_reached_min_motion_m', default_value='0.01',
+        description='Minimum end-effector motion after target send before MCU reached is trusted',
     )
 
     # ---- Detection nodes ----
@@ -171,6 +215,8 @@ def generate_launch_description():
             'target_class': LaunchConfiguration('target_class'),
             'serial_tx_log': LaunchConfiguration('serial_tx_log'),
             'serial_tx_log_hex': LaunchConfiguration('serial_tx_log_hex'),
+            'serial_rx_log': LaunchConfiguration('serial_rx_log'),
+            'serial_rx_log_hex': LaunchConfiguration('serial_rx_log_hex'),
             'camera_tilt_forward_deg': LaunchConfiguration('camera_tilt_forward_deg'),
             'command_offset_x_m': LaunchConfiguration('command_offset_x_m'),
             'command_offset_y_m': LaunchConfiguration('command_offset_y_m'),
@@ -185,6 +231,25 @@ def generate_launch_description():
             ),
             'grasp_occlusion_timeout_sec': LaunchConfiguration(
                 'grasp_occlusion_timeout_sec'
+            ),
+            'arrival_stall_enabled': LaunchConfiguration('arrival_stall_enabled'),
+            'arrival_stall_epsilon_m': LaunchConfiguration(
+                'arrival_stall_epsilon_m'
+            ),
+            'arrival_stall_frames': LaunchConfiguration('arrival_stall_frames'),
+            'arrival_stall_max_distance_m': LaunchConfiguration(
+                'arrival_stall_max_distance_m'
+            ),
+            'feedback_loss_abort_sec': LaunchConfiguration('feedback_loss_abort_sec'),
+            'mcu_reached_enabled': LaunchConfiguration('mcu_reached_enabled'),
+            'mcu_reached_stable_frames': LaunchConfiguration(
+                'mcu_reached_stable_frames'
+            ),
+            'mcu_reached_max_distance_m': LaunchConfiguration(
+                'mcu_reached_max_distance_m'
+            ),
+            'mcu_reached_min_motion_m': LaunchConfiguration(
+                'mcu_reached_min_motion_m'
             ),
         }],
         output='screen',
@@ -255,6 +320,8 @@ def generate_launch_description():
         debug_projection_log_arg,
         serial_tx_log_arg,
         serial_tx_log_hex_arg,
+        serial_rx_log_arg,
+        serial_rx_log_hex_arg,
         camera_tilt_forward_arg,
         command_offset_x_arg,
         command_offset_y_arg,
@@ -264,6 +331,15 @@ def generate_launch_description():
         grasp_occlusion_hold_arg,
         grasp_command_filter_window_arg,
         grasp_occlusion_timeout_arg,
+        arrival_stall_enabled_arg,
+        arrival_stall_epsilon_arg,
+        arrival_stall_frames_arg,
+        arrival_stall_max_distance_arg,
+        feedback_loss_abort_arg,
+        mcu_reached_enabled_arg,
+        mcu_reached_stable_frames_arg,
+        mcu_reached_max_distance_arg,
+        mcu_reached_min_motion_arg,
         yolo_node,
         calc_node,
         arm_bridge_node,
